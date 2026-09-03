@@ -2,7 +2,7 @@
 
 ## Goal
 
-1. **Disable summaries for subagents** — prevent any summary generation path (hook → worker → SDK agent) from firing for events originating in a Claude Code subagent.
+1. **Defer summaries for subagents to canonical recovery** — prevent direct summary generation (hook → worker → SDK agent) for events originating in a Claude Code subagent. The finalized canonical transcript is the only recovery source; it can later create a lineage-anchored recovery job when needed.
 2. **Label observations from subagents** — tag every observation with the subagent identity (agent_id + agent_type) so downstream queries can distinguish main-session work from subagent work.
 
 ## Phase 0 — Documentation Discovery (COMPLETE)
@@ -38,7 +38,7 @@
 ### Anti-patterns to avoid
 
 - Do NOT assume `agent_id` is present on the main session — it is undefined there. Treat presence as the discriminator.
-- Do NOT register SubagentStop as a new hook in `hooks.json` just to "disable" summaries — defensively short-circuiting in the handler is simpler and covers both current and future Claude Code versions where Stop might fire in subagent contexts.
+- Do NOT register SubagentStop as a new hook in `hooks.json` just to alter summary behavior — the worker-side `agentId` guard covers current and future Stop-hook delivery without a second summary owner.
 - Do NOT rely on `session_id` to distinguish — it is shared.
 - Do NOT invent a `parent_tool_use_id` field in hook input. The Claude Code docs do not expose parent tool use ID on hook payloads. Only use `agent_id` + `agent_type`.
 - Do NOT break the existing observation hash-dedup logic in `store.ts:19-28` — leave the hash inputs as-is.
@@ -85,25 +85,17 @@
 
 ---
 
-## Phase 2 — Short-circuit summary generation in subagent context
+## Phase 2 — Defer subagent summary generation to canonical recovery
 
 **What to implement**:
 
-1. Edit `src/cli/handlers/summarize.ts:27-36`, immediately after the worker-ready check (line 34) and before any processing:
+1. Preserve subagent identity in `src/cli/handlers/summarize.ts` and pass it to the worker fallback. The hook must not try to infer transcript lineage itself. `agentId` is the discriminator; `agentType` alone can occur for a main session started with `--agent`.
    ```ts
-   // Skip summaries in subagent context — subagents do not own the session summary.
-   // Main Stop hook owns it; SubagentStop (if ever registered) must no-op.
-   if (input.agentId || input.agentType) {
-     logger.debug('HOOK', 'Skipping summary: subagent context detected', {
-       sessionId: input.sessionId,
-       agentId: input.agentId,
-       agentType: input.agentType
-     });
-     return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
-   }
+   // Do not skip locally: the worker records the transcript locator and
+   // returns deferred_to_canonical_recovery without invoking the SDK agent.
    ```
 
-2. (Safety) Edit `src/services/worker/http/routes/SessionRoutes.ts` in `handleSummarizeByClaudeId` (around line 655-692): add a defensive guard that rejects the summarize request if the body includes `agentId` or `agentType`. Return `{ status: 'skipped', reason: 'subagent_context' }`. This is belt-and-suspenders in case any caller bypasses the hook layer.
+2. In `src/services/worker/http/routes/SessionRoutes.ts`, add a defensive `agentId` guard. Return `{ status: 'deferred_to_canonical_recovery' }` before queueing the SDK generator, and retain the transcript locator for canonical recovery.
 
 3. Extend the `/api/sessions/summarize` body in `src/cli/handlers/summarize.ts:73-82` to include `agentId` and `agentType` (passthrough) so the worker can make the same decision independently. Only pass fields when defined:
    ```ts
@@ -119,13 +111,14 @@
 **Documentation references**: summarize.ts handler flow at `src/cli/handlers/summarize.ts:27-143`; summarize route at `src/services/worker/http/routes/SessionRoutes.ts:655-692`.
 
 **Verification checklist**:
-- Unit test or manual dispatch with a payload containing `agent_id: "agent-abc"` → summarize handler returns before calling `/api/sessions/summarize`.
-- `grep -n "subagent" src/cli/handlers/summarize.ts` → finds the new guard.
-- `grep -n "subagent_context\|agentId" src/services/worker/http/routes/SessionRoutes.ts` → finds the server-side guard.
+- Unit test or manual dispatch with a payload containing `agent_id: "agent-abc"` → worker returns `deferred_to_canonical_recovery` without starting the SDK generator.
+- `grep -n "agentId" src/cli/handlers/summarize.ts` → finds the passthrough.
+- `grep -n "deferred_to_canonical_recovery\|agentId" src/services/worker/http/routes/SessionRoutes.ts` → finds the server-side guard.
 
 **Anti-pattern guards**:
+- Do NOT use `agentType` alone as the subagent discriminator — a main session launched with `--agent` still owns its summary.
 - Do NOT also short-circuit in `session-complete` or `context` handlers — the session's main Stop still cleans up.
-- Do NOT log at info level (spammy); `logger.debug` only.
+- Log the worker deferral once at info level because it is an operator-visible recovery decision; keep hook-level diagnostics at debug level.
 
 ---
 
@@ -261,9 +254,9 @@ The SDK agent parses `<observation>` XML into an `ObservationInput` and calls `s
 **What to implement**:
 
 1. Add a unit test at `tests/cli/handlers/summarize-subagent-skip.test.ts` verifying:
-   - When `input.agentId` is set, handler returns early with `exitCode: SUCCESS` and does NOT call `workerHttpRequest`.
-   - When `input.agentType` is set, same behavior.
-   - When both are undefined, handler proceeds (mock worker response).
+   - When `input.agentId` is set, the handler preserves it for the worker guard; the worker returns `deferred_to_canonical_recovery` without starting direct generation.
+   - When only `input.agentType` is set, the main session proceeds (`--agent` does not imply a subagent).
+   - When both are undefined, the main-session path proceeds.
 
 2. Add a unit test at `tests/cli/adapters/claude-code-subagent.test.ts` verifying:
    - `normalizeInput({ agent_id: "agent-abc", agent_type: "Explore" })` returns `{ agentId: "agent-abc", agentType: "Explore" }`.
@@ -292,7 +285,7 @@ The SDK agent parses `<observation>` XML into an `ObservationInput` and calls `s
 After Phases 1-5 land and pass verification:
 
 1. **Build**: `npm run build-and-sync`.
-2. **Commit**: a single commit titled `feat: disable subagent summaries and label subagent observations` with co-author footer.
+2. **Commit**: a single commit titled `feat: defer subagent summaries to canonical recovery and label observations` with co-author footer.
 3. **Push branch**: push current worktree branch `trail-guarantee` (or a new feature branch — confirm with `git status`). Create PR via `gh pr create` with summary of both features.
 4. **Run `/loop 5m`** to continuously re-check PR review comments: as each CodeRabbit/Greptile/human comment arrives, address it in a new commit, push, and re-check. Exit loop only when all actionable review comments are resolved and status checks pass.
 5. **Merge to main** via `gh pr merge --squash --auto` (or `--merge` per repo convention — inspect `.github/` first).
@@ -309,7 +302,7 @@ After Phases 1-5 land and pass verification:
 ## Final Verification (end of Phase 5, before Phase 6)
 
 - `grep -rn "agent_id\|agentId" src/` → fields present in: `types.ts`, `claude-code.ts`, `summarize.ts`, `observation.ts`, `SessionRoutes.ts`, observation types, store, migration010.
-- `grep -rn "subagent_context" src/services/worker/` → worker-side guard present.
+- `grep -rn "deferred_to_canonical_recovery" src/services/worker/` → worker-side guard present.
 - `sqlite3 ~/.claude-mem/claude-mem.db "PRAGMA table_info(observations);"` → includes `agent_type`, `agent_id`.
 - `npm test && npm run build` → both green.
 - Smoke test: simulate a subagent hook payload end-to-end → observation labeled, no summary fired.

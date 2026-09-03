@@ -201,24 +201,29 @@ export class OpenRouterProvider extends OpenAICompatibleProvider<OpenRouterConfi
     priorRequestId: string | null,
     attemptSignal: AbortSignal
   ): Promise<Response> {
+    const isOpenRouter = apiUrl.includes('openrouter.ai');
     return fetch(apiUrl, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${apiKey}`,
-        'HTTP-Referer': siteUrl || 'https://github.com/thedotmack/claude-mem',
-        'X-Title': appName || 'claude-mem',
+        'Accept': 'application/json',
         'Content-Type': 'application/json',
+        ...(isOpenRouter ? {
+          'HTTP-Referer': siteUrl || 'https://github.com/thedotmack/claude-mem',
+          'X-Title': appName || 'claude-mem',
+        } : {}),
         ...(priorRequestId ? { 'x-claude-mem-prior-request-id': priorRequestId } : {}),
       },
       body: JSON.stringify({
         model,
         messages,
-        temperature: 0.3,  // Lower temperature for structured extraction
+        temperature: 0.1,
+        stream: false,
         max_tokens: 4096,
         // Ask openrouter.ai for usage accounting (token counts + cost).
         // Only sent to openrouter.ai — strict custom gateways may reject
         // unknown body fields.
-        ...(apiUrl.includes('openrouter.ai') ? { usage: { include: true } } : {}),
+        ...(isOpenRouter ? { usage: { include: true } } : {}),
       }),
       signal: attemptSignal,
     });

@@ -105,8 +105,10 @@ export function writeJsonFileAtomic(filepath: string, data: any): void {
         dirFd = openSync(dir, 'r');
         fsyncSync(dirFd);
       } catch (dirSyncErr) {
-        const dirSyncError = dirSyncErr instanceof Error ? dirSyncErr : new Error(String(dirSyncErr));
-        emitDiagnostic(`claude-mem: directory fsync failed for ${dir}: ${dirSyncError.message}\n`);
+        // A successful rename without a durable parent-directory entry is not
+        // a successful atomic write.  Callers that use this as a release proof
+        // must fail closed and retry after the filesystem error is resolved.
+        throw dirSyncErr;
       } finally {
         if (dirFd !== undefined) {
           try { closeSync(dirFd); } catch { /* ignore */ }

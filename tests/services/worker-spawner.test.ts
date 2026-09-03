@@ -1,6 +1,10 @@
 
 import { describe, it, expect, mock } from 'bun:test';
+import { mkdtempSync, rmSync } from 'fs';
+import { join } from 'path';
+import { tmpdir } from 'os';
 import { HOOK_TIMEOUTS } from '../../src/shared/hook-constants.js';
+import { ReleaseWindowManager } from '../../src/services/release/ReleaseWindow.js';
 
 const processManager = {
   cleanStalePidFile: mock(() => 'dead' as 'alive' | 'dead'),
@@ -183,6 +187,27 @@ describe('ensureWorkerStarted startup readiness', () => {
 });
 
 describe('ensureWorkerStarted validation guards', () => {
+
+  it('rejects ordinary hook starts for every active release phase', async () => {
+    resetMocks();
+    const dataDir = mkdtempSync(join(tmpdir(), 'claude-mem-worker-release-fence-'));
+    const previousDataDir = process.env.CLAUDE_MEM_DATA_DIR;
+    process.env.CLAUDE_MEM_DATA_DIR = dataDir;
+    try {
+      const release = new ReleaseWindowManager(dataDir);
+      const window = release.begin(null);
+      expect(await ensureWorkerStarted(39008, import.meta.filename)).toBe('dead');
+      expect(processManager.spawnDaemon).not.toHaveBeenCalled();
+
+      release.transition(window.generation, 'rolling_back');
+      expect(await ensureWorkerStarted(39008, import.meta.filename)).toBe('dead');
+      expect(processManager.spawnDaemon).not.toHaveBeenCalled();
+    } finally {
+      if (previousDataDir === undefined) delete process.env.CLAUDE_MEM_DATA_DIR;
+      else process.env.CLAUDE_MEM_DATA_DIR = previousDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
 
   it('returns "dead" when workerScriptPath is empty string', async () => {
     const result = await ensureWorkerStarted(39001, '');

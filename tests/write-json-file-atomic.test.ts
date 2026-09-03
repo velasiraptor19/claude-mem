@@ -181,4 +181,12 @@ describe('writeJsonFileAtomic', () => {
     // The pre-existing directory should still be there — we didn't clobber it.
     expect(statSync(target).isDirectory()).toBe(true);
   });
+
+  it('treats parent-directory fsync failure as a write failure instead of logging and continuing', () => {
+    const source = readFileSync(join(import.meta.dir, '../src/shared/atomic-json.ts'), 'utf8');
+    const directorySync = source.indexOf('fsyncSync(dirFd)');
+    const failure = source.indexOf('throw dirSyncErr', directorySync);
+    expect(directorySync).toBeGreaterThan(-1);
+    expect(failure).toBeGreaterThan(directorySync);
+  });
 });

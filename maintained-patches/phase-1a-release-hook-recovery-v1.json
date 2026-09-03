@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 1,
+  "upstreamVersion": "13.14.0",
+  "upstreamCommit": "de4930c0410ec9badb21dff98dd7bf409d5aac20",
+  "scope": {
+    "id": "phase-1a-release-hook-recovery",
+    "version": 1,
+    "allowedPaths": [
+      "scripts/maintained-upgrade.sh",
+      "scripts/release-transaction.cjs",
+      "scripts/release-window.cjs",
+      "scripts/verify-approved-manifest.cjs",
+      "scripts/write-build-attestation.cjs",
+      "src/services/recovery/CodexTranscriptRecovery.ts",
+      "src/services/recovery/HistoricalFingerprintReconciler.ts",
+      "src/services/recovery/HistoricalRecoveryScanner.ts",
+      "src/services/recovery/RecoveryConsumer.ts",
+      "src/services/recovery/RecoveryJobService.ts",
+      "src/services/recovery/RecoveryScannerScheduler.ts",
+      "src/services/release/ReleaseWindow.ts",
+      "src/services/release/attestation.ts",
+      "src/services/worker-service.ts",
+      "src/services/worker-spawner.ts"
+    ]
+  },
+  "approvedBundleSha256": "daee19b4e0a1d9f6e8a0daa5da3a8da045205134ac101c45574c5dfaf2782ffa",
+  "files": {
+    "scripts/maintained-upgrade.sh": "2d53ecbac33ae83ab058cb8301dbf9c7d18471f750d07455df36c2980a9ef42c",
+    "scripts/release-transaction.cjs": "26d76bc10f0115cf338bd5b2f9d6a6a0722366fce3ecc2c6f920bf16f9827e63",
+    "scripts/release-window.cjs": "d658cdfc5cddbed58660b06d159358e7840b70889a0533601d94b93a81dfff73",
+    "scripts/verify-approved-manifest.cjs": "9135a6af2fec2d1e99c180babb38abe8225c8f55e18525045038f33fa559a0b4",
+    "scripts/write-build-attestation.cjs": "8642252ddb2581fb0aea0697507b6f88248d0c8eaa714f826641924ac2051dc5",
+    "src/services/recovery/CodexTranscriptRecovery.ts": "0cee3d4d5fd2d7885b837b9f9439a7d32a40616377a99767a46d2516642d2289",
+    "src/services/recovery/HistoricalFingerprintReconciler.ts": "e465775437893a8cf612f7a1ff49303ce10c15701737c5f322f1e3c5855d18d0",
+    "src/services/recovery/HistoricalRecoveryScanner.ts": "9d793afd667f97038565a6a50f94173e4a59d4fc73c335beb8cc2418fa3a5ec1",
+    "src/services/recovery/RecoveryConsumer.ts": "2d97658c99010b0a7be698d28c9567276c4dbf4c702f5178949f4135c6bf8b13",
+    "src/services/recovery/RecoveryJobService.ts": "da517ea6db2fc0da1b77a7c153759596a739bac1d9bac1efa34623c9f503defd",
+    "src/services/recovery/RecoveryScannerScheduler.ts": "a1a5b5e730c87ad54875e30dda5253a240c4b1cfcdbdb950c36ae99095792dfc",
+    "src/services/release/ReleaseWindow.ts": "505e36c0ef377b94ca07820d267cf7a886424219bc9d20e4cf37f21034088760",
+    "src/services/release/attestation.ts": "3b75674b65b60abcc3dab9828e282cb0718da4e6cba76ed3fa4414feb93678f3",
+    "src/services/worker-service.ts": "8de285ecb40ad363e58dc57d74dd88d00e257dafc2217316abfd491e8dfc1b8c",
+    "src/services/worker-spawner.ts": "86dee337a1392509460db98414eb9fe32549954ee82fcc6865ae805f2ea0b60d"
+  },
+  "expectedFileCount": 15
+}

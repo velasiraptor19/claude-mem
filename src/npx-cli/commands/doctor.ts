@@ -6,12 +6,14 @@
  */
 
 import { existsSync, readFileSync } from 'fs';
-import { join } from 'path';
+import { dirname, join } from 'path';
 import { styleText } from 'node:util';
 import { isPluginInstalled, marketplaceDirectory, readPluginVersion } from '../utils/paths.js';
 import { getBunVersion, getUvVersion, isInstallCurrent } from '../install/setup-runtime.js';
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
-import { resolveDataDir } from '../../shared/paths.js';
+import { DB_PATH, resolveDataDir } from '../../shared/paths.js';
+import { buildReleaseIdentity, buildStoreTopologyIdentity, type ReleaseIdentityV1, type StoreTopologyIdentityV1 } from '../../services/release/attestation.js';
+import { resolveWorkerScriptPath } from '../../shared/worker-utils.js';
 
 type CheckStatus = 'ok' | 'warn' | 'fail';
 
@@ -44,7 +46,14 @@ async function probeWorkerHealth(workerHost: string, workerPort: string): Promis
   return { status: 'warn', detail: `reachable but unhealthy (HTTP ${res.status}) at ${workerUrl}` };
 }
 
-export async function runDoctorCommand(): Promise<void> {
+export interface DoctorJsonV1 {
+  schemaVersion: 1;
+  releaseIdentity: ReleaseIdentityV1;
+  storeTopologyIdentity: StoreTopologyIdentityV1;
+  operationalSnapshot: { generatedAt: string; checks: Array<Pick<CheckResult, 'name' | 'status' | 'required'>> };
+}
+
+export async function runDoctorCommand(options: { json?: boolean } = {}): Promise<void> {
   const checks: CheckResult[] = [];
   const dataDir = resolveDataDir();
 
@@ -101,10 +110,13 @@ export async function runDoctorCommand(): Promise<void> {
   const workerPort = SettingsDefaultsManager.get('CLAUDE_MEM_WORKER_PORT');
   let workerStatus: CheckStatus = 'fail';
   let workerDetail = `no response at http://${workerHost}:${workerPort} — start with \`npx claude-mem start\``;
+  let workerHealthPayload: Record<string, unknown> | null = null;
   try {
     const worker = await probeWorkerHealth(workerHost, workerPort);
     workerStatus = worker.status;
     workerDetail = worker.detail;
+    const response = await fetch(`http://${workerHost}:${workerPort}/api/health`, { signal: AbortSignal.timeout(3000) });
+    workerHealthPayload = await response.json() as Record<string, unknown>;
   } catch {
     // leave as fail
   }
@@ -133,6 +145,49 @@ export async function runDoctorCommand(): Promise<void> {
       detail,
       required: false,
     });
+  }
+
+  const workerPath = typeof workerHealthPayload?.workerPath === 'string'
+    ? workerHealthPayload.workerPath
+    : join(marketplaceDir, 'plugin', 'scripts', 'worker-service.cjs');
+  // The resolver is the same artifact selector used by hooks/restart.  Never
+  // print either path: a boolean compatibility verdict is the public surface.
+  const hookWorkerPath = resolveWorkerScriptPath();
+  const workerManifestPath = join(dirname(workerPath), '..', '.claude-plugin', 'plugin.json');
+  const workerVersion = typeof workerHealthPayload?.version === 'string' ? workerHealthPayload.version : null;
+  const workerPid = typeof workerHealthPayload?.pid === 'number' ? workerHealthPayload.pid : null;
+  const managedVersion = readPluginVersion();
+  const releaseIdentity = buildReleaseIdentity({
+    managedPluginVersion: managedVersion,
+    workerVersion,
+    workerBundlePath: workerPath,
+    manifestPath: workerManifestPath,
+    workerEndpoint: `${workerHost}:${workerPort}`,
+    workerHealth: workerStatus === 'ok' ? 'healthy' : workerStatus === 'warn' ? 'unhealthy' : 'unreachable',
+    workerPid,
+    hookWorkerPath,
+    dataDir,
+  });
+  const artifactCompatible = workerVersion === null ? installed : workerVersion === managedVersion;
+  const storeTopologyIdentity = buildStoreTopologyIdentity({
+    dataDir,
+    dbPath: DB_PATH,
+    codexCompatible: artifactCompatible,
+    claudeCompatible: installed && artifactCompatible,
+  });
+  const json: DoctorJsonV1 = {
+    schemaVersion: 1,
+    releaseIdentity,
+    storeTopologyIdentity,
+    operationalSnapshot: {
+      generatedAt: new Date().toISOString(),
+      checks: checks.map(({ name, status, required }) => ({ name, status, required })),
+    },
+  };
+
+  if (options.json) {
+    console.log(JSON.stringify(json));
+    return;
   }
 
   const icon = (s: CheckStatus): string =>

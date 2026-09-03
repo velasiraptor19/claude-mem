@@ -3,7 +3,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { writeFileSync, mkdirSync, rmSync, existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { readLastLines } from '../../src/services/worker/http/routes/LogsRoutes.js';
+import { readLastLines, resolveActiveLogFile } from '../../src/services/worker/http/routes/LogsRoutes.js';
 
 describe('readLastLines (#1203 OOM fix)', () => {
   const testDir = join(tmpdir(), `claude-mem-logs-test-${Date.now()}`);
@@ -111,5 +111,30 @@ describe('readLastLines (#1203 OOM fix)', () => {
     for (const l of resultLines) {
       expect(l).toBe('A'.repeat(100));
     }
+  });
+});
+
+describe('resolveActiveLogFile', () => {
+  const testDir = join(tmpdir(), `claude-mem-log-resolution-${Date.now()}`);
+
+  afterEach(() => {
+    if (existsSync(testDir)) rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it('selects the file that is actively receiving logs across a date rollover', async () => {
+    mkdirSync(testDir, { recursive: true });
+    const staleNamedFile = join(testDir, 'claude-mem-2026-07-30.log');
+    const todayNamedFile = join(testDir, 'claude-mem-2026-07-31.log');
+    writeFileSync(todayNamedFile, 'hook log\n');
+    await Bun.sleep(10);
+    writeFileSync(staleNamedFile, 'worker api error\n');
+
+    expect(resolveActiveLogFile(testDir, new Date('2026-07-31T20:00:00Z'))).toBe(staleNamedFile);
+  });
+
+  it('returns today path when the log directory is empty', () => {
+    mkdirSync(testDir, { recursive: true });
+    expect(resolveActiveLogFile(testDir, new Date('2026-07-31T20:00:00Z')))
+      .toBe(join(testDir, 'claude-mem-2026-07-31.log'));
   });
 });
