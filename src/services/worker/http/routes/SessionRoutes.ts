@@ -10,6 +10,7 @@ import { DatabaseManager } from '../../DatabaseManager.js';
 import { ClaudeProvider } from '../../ClaudeProvider.js';
 import { GeminiProvider, isGeminiSelected, isGeminiAvailable } from '../../GeminiProvider.js';
 import { OpenRouterProvider, isOpenRouterSelected, isOpenRouterAvailable } from '../../OpenRouterProvider.js';
+import { NvidiaProvider, isNvidiaSelected, isNvidiaAvailable } from '../../NvidiaProvider.js';
 import type { WorkerService } from '../../../worker-service.js';
 import { BaseRouteHandler } from '../BaseRouteHandler.js';
 import { SessionEventBroadcaster } from '../../events/SessionEventBroadcaster.js';
@@ -33,6 +34,13 @@ import { isClassified } from '../../provider-errors.js';
 import { classifyClaudeError } from '../../ClaudeProvider.js';
 
 const MAX_USER_PROMPT_BYTES = 256 * 1024;
+
+export function selectAvailableProvider(input: { nvidia: boolean; openrouter: boolean; gemini: boolean }): 'claude' | 'gemini' | 'openrouter' | 'nvidia' {
+  if (input.nvidia) return 'nvidia';
+  if (input.openrouter) return 'openrouter';
+  if (input.gemini) return 'gemini';
+  return 'claude';
+}
 
 /**
  * Collapse session.abortReason onto a closed telemetry enum. The raw value can
@@ -59,6 +67,7 @@ export class SessionRoutes extends BaseRouteHandler {
     private sdkAgent: ClaudeProvider,
     private geminiAgent: GeminiProvider,
     private openRouterAgent: OpenRouterProvider,
+    private nvidiaAgent: NvidiaProvider,
     private eventBroadcaster: SessionEventBroadcaster,
     private workerService: WorkerService,
     private completionHandler: SessionCompletionHandler,
@@ -66,11 +75,12 @@ export class SessionRoutes extends BaseRouteHandler {
     super();
   }
 
-  private getSelectedProvider(): 'claude' | 'gemini' | 'openrouter' {
-    if (isOpenRouterSelected() && isOpenRouterAvailable()) {
-      return 'openrouter';
-    }
-    return (isGeminiSelected() && isGeminiAvailable()) ? 'gemini' : 'claude';
+  private getSelectedProvider(): 'claude' | 'gemini' | 'openrouter' | 'nvidia' {
+    return selectAvailableProvider({
+      nvidia: isNvidiaSelected() && isNvidiaAvailable(),
+      openrouter: isOpenRouterSelected() && isOpenRouterAvailable(),
+      gemini: isGeminiSelected() && isGeminiAvailable(),
+    });
   }
 
   public async ensureGeneratorRunning(sessionDbId: number, source: string): Promise<void> {
@@ -135,7 +145,7 @@ export class SessionRoutes extends BaseRouteHandler {
 
   private async startGeneratorWithProvider(
     session: ReturnType<typeof this.sessionManager.getSession>,
-    provider: 'claude' | 'gemini' | 'openrouter',
+    provider: 'claude' | 'gemini' | 'openrouter' | 'nvidia',
     source: string
   ): Promise<void> {
     if (!session) return;
@@ -147,8 +157,8 @@ export class SessionRoutes extends BaseRouteHandler {
       session.abortController = new AbortController();
     }
 
-    const agent = provider === 'openrouter' ? this.openRouterAgent : (provider === 'gemini' ? this.geminiAgent : this.sdkAgent);
-    const agentName = provider === 'openrouter' ? 'OpenRouter' : (provider === 'gemini' ? 'Gemini' : 'Claude SDK');
+    const agent = provider === 'nvidia' ? this.nvidiaAgent : (provider === 'openrouter' ? this.openRouterAgent : (provider === 'gemini' ? this.geminiAgent : this.sdkAgent));
+    const agentName = provider === 'nvidia' ? 'NVIDIA NIM' : (provider === 'openrouter' ? 'OpenRouter' : (provider === 'gemini' ? 'Gemini' : 'Claude SDK'));
 
     const actualQueueDepth = this.sessionManager.getMessageBuffer().getPendingCount(session.sessionDbId);
 
@@ -213,6 +223,20 @@ export class SessionRoutes extends BaseRouteHandler {
           provider,
           error: errorMsg,
         }, error);
+        const persistedSession = this.dbManager.getSessionById(session.sessionDbId);
+        // A recovery job must be anchored to one canonical transcript turn
+        // (fingerprint, prompt number, turn id, and lineage).  This live
+        // generator path only knows a session, so it cannot safely create one.
+        // SessionCompletionHandler/the historical scanner derive those fields
+        // from the finalized Codex transcript instead.
+        logger.warn('SESSION', 'Deferred failed generator batch to canonical transcript recovery', {
+          sessionId: session.sessionDbId,
+          contentSessionId: session.contentSessionId,
+          project: session.project,
+          platformSource: session.platformSource,
+          transcriptLocator: persistedSession.transcript_locator,
+          provider,
+        });
         telemetryBuffer.record('session_compressed', session.sessionDbId, {
           outcome: 'error',
           provider,
@@ -302,6 +326,8 @@ export class SessionRoutes extends BaseRouteHandler {
     contentSessionId: z.string().min(1),
     last_assistant_message: z.string().optional(),
     agentId: z.string().optional(),
+    agentType: z.string().optional(),
+    transcriptPath: z.string().optional(),
     platformSource: z.string().optional(),
   }).passthrough();
 
@@ -345,11 +371,22 @@ export class SessionRoutes extends BaseRouteHandler {
   });
 
   private handleSummarizeByClaudeId = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
-    const { contentSessionId, last_assistant_message, agentId } = req.body;
+    const { contentSessionId, last_assistant_message, agentId, transcriptPath } = req.body;
     const platformSource = this.getPlatformSourceFromRequest(req);
 
     if (agentId) {
-      res.json({ status: 'skipped', reason: 'subagent_context' });
+      // The hook supplies only session-level subagent metadata.  Do not enqueue
+      // an unanchored recovery job here: RecoveryConsumer deliberately rejects
+      // it as lineage_mismatch.  The finalized Codex JSONL is canonicalized by
+      // SessionCompletionHandler/the scanner and produces one job per turn.
+      logger.info('SESSION', 'Deferred subagent summary to canonical transcript recovery', {
+        contentSessionId,
+        agentId,
+        project: req.body.project || getProjectContext(req.body.cwd || process.cwd()).primary,
+        platformSource,
+        transcriptLocator: transcriptPath ?? null,
+      });
+      res.json({ status: 'deferred_to_canonical_recovery' });
       return;
     }
 
@@ -374,6 +411,10 @@ export class SessionRoutes extends BaseRouteHandler {
       ? stripMemoryTags(String(last_assistant_message))
       : last_assistant_message;
     await this.sessionManager.queueSummarize(sessionDbId, cleanedLastAssistantMessage);
+
+    if (transcriptPath) {
+      store.db.prepare('UPDATE sdk_sessions SET transcript_locator=? WHERE id=?').run(transcriptPath, sessionDbId);
+    }
 
     await this.ensureGeneratorRunning(sessionDbId, 'summarize');
 

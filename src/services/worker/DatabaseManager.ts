@@ -103,6 +103,7 @@ export class DatabaseManager {
     user_prompt: string;
     custom_title: string | null;
     status: string;
+    transcript_locator: string | null;
   } {
     const session = this.getSessionStore().getSessionById(sessionDbId);
     if (!session) {

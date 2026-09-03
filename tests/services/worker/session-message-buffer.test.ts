@@ -72,6 +72,33 @@ describe('SessionMessageBuffer (in-RAM observation buffer)', () => {
     expect(second.map(m => m.tool_name)).toEqual(['Write']);
   });
 
+  test('allows two malformed retries, then preserves the claimed batch', async () => {
+    const buffer = new SessionMessageBuffer();
+    buffer.enqueue(1, obs('Read', 'a'));
+
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const drained = await drainAll(buffer, 1);
+      const result = buffer.recordMalformedClaim(1, drained.map(message => message._persistentId), 2);
+      expect(result.retry).toBe(true);
+      expect(result.retryCount).toBe(attempt);
+      expect(buffer.getPendingCount(1)).toBe(1);
+    }
+
+    const drained = await drainAll(buffer, 1);
+    const exhausted = buffer.recordMalformedClaim(1, drained.map(message => message._persistentId), 2);
+    expect(exhausted.retry).toBe(false);
+    expect(exhausted.retryCount).toBe(3);
+    expect(exhausted.messages).toHaveLength(1);
+    expect(buffer.getPendingCount(1)).toBe(1);
+
+    expect(buffer.markRecoveryPending(1, exhausted.messages.map(message => message._persistentId))).toBe(1);
+
+    // Quarantined: neither a later drain nor generic generator reset can spin
+    // on the exhausted message.
+    expect(buffer.resetClaimed(1)).toBe(0);
+    expect(await drainAll(buffer, 1)).toEqual([]);
+  });
+
   test('clear empties a session; dispose forgets it', () => {
     const buffer = new SessionMessageBuffer();
     buffer.enqueue(1, obs('Read', 'a'));

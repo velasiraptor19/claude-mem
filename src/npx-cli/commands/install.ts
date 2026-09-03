@@ -818,7 +818,7 @@ function mergeSettings(updates: Record<string, string>): boolean {
   }
 }
 
-type ProviderId = 'claude' | 'gemini' | 'openrouter';
+type ProviderId = 'claude' | 'gemini' | 'openrouter' | 'nvidia';
 /**
  * What the installer prompt may offer. `cmem` is a prompt-only sentinel: picking
  * it configures the generic OpenAI-compatible path (base URL + model + key) and
@@ -1174,6 +1174,7 @@ async function promptProvider(options: InstallOptions): Promise<ProviderId> {
         { value: 'openrouter', label: OPENROUTER_OPTION_LABEL },
         { value: 'gemini', label: GEMINI_OPTION_LABEL },
         { value: 'claude', label: CLAUDE_OPTION_LABEL },
+        { value: 'nvidia', label: 'NVIDIA NIM' },
       ],
       initialValue: 'cmem',
     });
@@ -1227,10 +1228,12 @@ async function promptProvider(options: InstallOptions): Promise<ProviderId> {
     return 'claude';
   }
 
-  const providerLabel = selectedProvider === 'gemini' ? 'Gemini' : 'OpenRouter';
+  const providerLabel = selectedProvider === 'gemini' ? 'Gemini' : selectedProvider === 'nvidia' ? 'NVIDIA NIM' : 'OpenRouter';
   const keyEnvName = selectedProvider === 'gemini'
     ? 'CLAUDE_MEM_GEMINI_API_KEY'
-    : 'CLAUDE_MEM_OPENROUTER_API_KEY';
+    : selectedProvider === 'nvidia'
+      ? 'CLAUDE_MEM_NVIDIA_API_KEY'
+      : 'CLAUDE_MEM_OPENROUTER_API_KEY';
 
   const existingKey = getSetting(keyEnvName as keyof SettingsDefaults) as string | undefined;
   if (existingKey && existingKey.trim().length > 0) {
@@ -1512,7 +1515,7 @@ async function promptCmemOnlineOptIn(version: string): Promise<void> {
 
 export interface InstallOptions {
   ide?: string;
-  provider?: 'claude' | 'gemini' | 'openrouter';
+  provider?: 'claude' | 'gemini' | 'openrouter' | 'nvidia';
   model?: string;
   noAutoStart?: boolean;
   disableAutoMemory?: boolean;
