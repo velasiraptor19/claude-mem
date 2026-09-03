@@ -134,13 +134,16 @@ export async function adoptMergedWorktrees(opts: {
   dataDirectory?: string;
   dryRun?: boolean;
   onlyBranch?: string;
+  chromaSync?: Pick<ChromaSync, 'updateMergedIntoProject'>;
+  projectContext?: typeof getProjectContext;
 } = {}): Promise<AdoptionResult> {
   const dataDirectory = opts.dataDirectory ?? DEFAULT_DATA_DIR;
   const dryRun = opts.dryRun ?? false;
   const startCwd = opts.repoPath ?? process.cwd();
 
   const mainRepo = resolveMainRepoPath(startCwd);
-  const parentProject = mainRepo ? getProjectContext(mainRepo).primary : '';
+  const projectContext = opts.projectContext ?? getProjectContext;
+  const parentProject = mainRepo ? projectContext(mainRepo).primary : '';
 
   const result: AdoptionResult = {
     repoPath: mainRepo ?? startCwd,
@@ -240,7 +243,7 @@ export async function adoptMergedWorktrees(opts: {
     const syncLane = hasSyncLane(db);
 
     const adoptWorktreeInTransaction = (wt: WorktreeEntry) => {
-      const worktreeProject = getProjectContext(wt.path).primary;
+      const worktreeProject = projectContext(wt.path).primary;
       const rows = selectObsForPatch.all(
         worktreeProject,
         parentProject
@@ -311,7 +314,7 @@ export async function adoptMergedWorktrees(opts: {
   }
 
   if (!dryRun && adoptedChromaTargets.length > 0) {
-    const chromaSync = new ChromaSync('claude-mem');
+    const chromaSync = opts.chromaSync ?? new ChromaSync('claude-mem');
     try {
       await chromaSync.updateMergedIntoProject(adoptedChromaTargets, parentProject);
       result.chromaUpdates = adoptedChromaTargets.length;

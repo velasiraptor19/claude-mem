@@ -10,6 +10,10 @@ describe('provider account gate', () => {
     expect(providerNeedsAccount('claude')).toBe(false);
   });
 
+  it('exempts NVIDIA because its configured API key is the complete credential', () => {
+    expect(providerNeedsAccount('nvidia')).toBe(false);
+  });
+
   it('still requires an account when no provider was named', () => {
     // The provider screen can still offer CMEM Pro, so login has to come first.
     expect(providerNeedsAccount(undefined)).toBe(true);

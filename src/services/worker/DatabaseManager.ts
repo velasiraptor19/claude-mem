@@ -105,6 +105,7 @@ export class DatabaseManager {
     status: string;
     observed_model: string | null;
     observed_billing: string | null;
+    transcript_locator: string | null;
   } {
     const session = this.getSessionStore().getSessionById(sessionDbId);
     if (!session) {

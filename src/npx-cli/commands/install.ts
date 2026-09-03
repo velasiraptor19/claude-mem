@@ -841,7 +841,7 @@ function mergeSettings(updates: Record<string, string>): boolean {
   }
 }
 
-type ProviderId = 'claude' | 'gemini' | 'openrouter';
+type ProviderId = 'claude' | 'gemini' | 'openrouter' | 'nvidia';
 /**
  * What the installer prompt may offer. `cmem` is a prompt-only sentinel: picking
  * it configures the generic OpenAI-compatible path (base URL + model + key) and
@@ -1076,6 +1076,9 @@ async function promptProvider(
         options: [
           { value: 'cmem', label: labels.cmem, hint: labels.cmemHint },
           { value: 'claude', label: labels.claude, hint: labels.claudeHint },
+          { value: 'openrouter', label: 'OpenRouter' },
+          { value: 'gemini', label: 'Gemini' },
+          { value: 'nvidia', label: 'NVIDIA NIM' },
         ],
         // CMEM Pro pre-selected: it is the recommended path and the one the
         // funnel is built around. Selecting it no longer means "pay now" —
@@ -1135,10 +1138,12 @@ async function promptProvider(
     return 'claude';
   }
 
-  const providerLabel = selectedProvider === 'gemini' ? 'Gemini' : 'OpenRouter';
+  const providerLabel = selectedProvider === 'gemini' ? 'Gemini' : selectedProvider === 'nvidia' ? 'NVIDIA NIM' : 'OpenRouter';
   const keyEnvName = selectedProvider === 'gemini'
     ? 'CLAUDE_MEM_GEMINI_API_KEY'
-    : 'CLAUDE_MEM_OPENROUTER_API_KEY';
+    : selectedProvider === 'nvidia'
+      ? 'CLAUDE_MEM_NVIDIA_API_KEY'
+      : 'CLAUDE_MEM_OPENROUTER_API_KEY';
 
   const existingKey = getSetting(keyEnvName as keyof SettingsDefaults) as string | undefined;
   const existingOpenRouterBaseUrl = selectedProvider === 'openrouter'
@@ -1795,12 +1800,12 @@ async function promptTelemetryOptIn(): Promise<void> {
  * must happen first.
  */
 export function providerNeedsAccount(provider: InstallOptions['provider']): boolean {
-  return provider !== 'claude';
+  return provider !== 'claude' && provider !== 'nvidia';
 }
 
 export interface InstallOptions {
   ide?: string;
-  provider?: 'claude' | 'gemini' | 'openrouter';
+  provider?: 'claude' | 'gemini' | 'openrouter' | 'nvidia';
   model?: string;
   noAutoStart?: boolean;
   disableAutoMemory?: boolean;
@@ -1868,9 +1873,11 @@ function validateNonInteractiveProvider(
     }, summary);
   }
 
-  if (options.provider !== 'gemini' && options.provider !== 'openrouter') return;
+  if (options.provider !== 'gemini' && options.provider !== 'openrouter' && options.provider !== 'nvidia') return;
   const keyName = options.provider === 'gemini'
     ? 'CLAUDE_MEM_GEMINI_API_KEY'
+    : options.provider === 'nvidia'
+      ? 'CLAUDE_MEM_NVIDIA_API_KEY'
     : 'CLAUDE_MEM_OPENROUTER_API_KEY';
   const key = String(getSetting(keyName as keyof SettingsDefaults) ?? '').trim();
   const configuredCmemKey = options.provider === 'openrouter'
@@ -2169,8 +2176,15 @@ async function runInstallCommandInner(options: InstallOptions, summary: InstallS
     getSetting('CLAUDE_MEM_CLOUD_SYNC_USER_ID'),
     getSetting('CLAUDE_MEM_CLOUD_SYNC_HUB_URL'),
   ].every((value) => typeof value === 'string' && value.trim().length > 0);
-  if (selectedProvider === 'claude') {
+  if (selectedProvider === 'nvidia' && options.model) {
+    const model = options.model.trim();
+    if (!model) throw new Error('--model must be a non-empty NVIDIA model id');
+    mergeSettings({ CLAUDE_MEM_NVIDIA_OBSERVATION_MODEL: model, CLAUDE_MEM_NVIDIA_SUMMARY_MODEL: model });
+    log.info(`Saved NVIDIA observation and summary model=${model} to ~/.claude-mem/settings.json`);
+  } else if (selectedProvider === 'claude') {
     await promptClaudeModel(options);
+  } else if (options.model) {
+    throw new Error(`--model is not supported with provider=${selectedProvider}; configure the provider-specific model setting instead.`);
   }
 
   // Hooks and MCP clients can lazily restart the worker while the browser is

@@ -64,15 +64,6 @@ export const summarizeHandler: EventHandler = {
       return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
     }
 
-    if (input.agentId) {
-      logger.debug('HOOK', 'Skipping summary: subagent context detected', {
-        sessionId: input.sessionId,
-        agentId: input.agentId,
-        agentType: input.agentType
-      });
-      return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
-    }
-
     const { sessionId, transcriptPath } = input;
 
     if (!sessionId) {
@@ -156,6 +147,9 @@ export const summarizeHandler: EventHandler = {
         platformSource,
         observedModel,
         observedBilling,
+        transcriptPath,
+        agentId: input.agentId,
+        agentType: input.agentType,
       },
     );
     if (isWorkerFallback(queueResult)) {

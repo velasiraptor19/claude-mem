@@ -220,7 +220,7 @@ export interface ChromaSyncLike {
     promptNumber: number,
     createdAtEpoch: number,
     platformSource?: string
-  ): Promise<void>;
+  ): Promise<void | { expected: number; written: number; complete: boolean }>;
   syncUserPrompt(
     promptId: number,
     memorySessionId: string,
@@ -838,7 +838,7 @@ export class SyncApply {
     if (this.chromaSync) {
       const chroma = this.chromaSync;
       const id = inserted.id;
-      chromaJobs.push(() => chroma.syncSummary(
+      chromaJobs.push(async () => { await chroma.syncSummary(
         id,
         memorySessionId,
         project,
@@ -852,7 +852,7 @@ export class SyncApply {
         },
         fieldNumber(op, body, 'prompt_number') ?? 0,
         createdAtEpoch
-      ));
+      ); });
     }
     return 'applied';
   }

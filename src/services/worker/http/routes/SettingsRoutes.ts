@@ -5,6 +5,7 @@ import path from 'path';
 import { readFileSync, existsSync, renameSync, mkdirSync } from 'fs';
 import { getPackageRoot, paths, expandTilde } from '../../../../shared/paths.js';
 import { logger } from '../../../../utils/logger.js';
+import { validateNvidiaSettings } from '../../NvidiaProvider.js';
 import { SettingsManager } from '../../SettingsManager.js';
 import { ModeManager } from '../../../domain/ModeManager.js';
 import { BaseRouteHandler } from '../BaseRouteHandler.js';
@@ -88,6 +89,16 @@ export class SettingsRoutes extends BaseRouteHandler {
       'CLAUDE_MEM_OPENROUTER_MODEL',
       'CLAUDE_MEM_OPENROUTER_SITE_URL',
       'CLAUDE_MEM_OPENROUTER_APP_NAME',
+      'CLAUDE_MEM_NVIDIA_API_KEY',
+      'CLAUDE_MEM_NVIDIA_BASE_URL',
+      'CLAUDE_MEM_NVIDIA_ALLOW_INSECURE_GATEWAY',
+      'CLAUDE_MEM_NVIDIA_OBSERVATION_MODEL',
+      'CLAUDE_MEM_NVIDIA_SUMMARY_MODEL',
+      'CLAUDE_MEM_NVIDIA_MAX_INPUT_TOKENS',
+      'CLAUDE_MEM_NVIDIA_MAX_OUTPUT_TOKENS',
+      'CLAUDE_MEM_NVIDIA_TEMPERATURE',
+      'CLAUDE_MEM_NVIDIA_TOP_P',
+      'CLAUDE_MEM_NVIDIA_RPM_LIMIT',
       'CLAUDE_MEM_DATA_DIR',
       'CLAUDE_MEM_LOG_LEVEL',
       'CLAUDE_MEM_PYTHON_VERSION',
@@ -142,9 +153,9 @@ export class SettingsRoutes extends BaseRouteHandler {
 
   private validateSettings(settings: any): { valid: boolean; error?: string } {
     if (settings.CLAUDE_MEM_PROVIDER) {
-    const validProviders = ['claude', 'gemini', 'openrouter'];
+    const validProviders = ['claude', 'gemini', 'openrouter', 'nvidia'];
     if (!validProviders.includes(settings.CLAUDE_MEM_PROVIDER)) {
-      return { valid: false, error: 'CLAUDE_MEM_PROVIDER must be "claude", "gemini", or "openrouter"' };
+      return { valid: false, error: 'CLAUDE_MEM_PROVIDER must be "claude", "gemini", "openrouter", or "nvidia"' };
       }
     }
 
@@ -241,6 +252,8 @@ export class SettingsRoutes extends BaseRouteHandler {
         return { valid: false, error: 'CLAUDE_MEM_OPENROUTER_SITE_URL must be a valid URL' };
       }
     }
+    const nvidiaError = validateNvidiaSettings(settings);
+    if (nvidiaError) return { valid: false, error: nvidiaError };
 
     return { valid: true };
   }

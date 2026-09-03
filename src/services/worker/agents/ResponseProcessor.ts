@@ -314,7 +314,7 @@ export async function processAgentResponse(
   // success paths stamp the same value.
   const providerName =
     session.currentProvider ??
-    ({ SDK: 'claude', Gemini: 'gemini', OpenRouter: 'openrouter' } as Record<string, string>)[agentName] ??
+    ({ SDK: 'claude', Gemini: 'gemini', OpenRouter: 'openrouter', 'NVIDIA NIM': 'nvidia' } as Record<string, string>)[agentName] ??
     'claude';
 
   if (!parsed.valid) {
@@ -372,34 +372,36 @@ export async function processAgentResponse(
       return;
     }
 
-    // Classify the non-XML output so a dropped batch is visible, not silent.
-    // Ordinary idle/prose is a claimed no-op batch: confirm it and do not build
-    // any respawn debt from repeated skip acknowledgements.
+    // Malformed output must never acknowledge and discard claimed work. Give
+    // the live stateful reducer two bounded repair passes; if those fail, keep
+    // the batch claimed and surface it to the durable-recovery integration hook.
     const outputClass = classifyObserverOutput(text);
     const preview = previewOutput(text);
-    session.consecutiveInvalidOutputs = 0;
-    // The overflow/quota/auth rejections returned above, so reaching here means
-    // the provider accepted this prompt and answered it. That is proof the
-    // conversation fits, whether or not the answer parsed — so the recycle
-    // counter resets here too. Resetting only on a valid parse let a generation
-    // that answered "idle" twice in a row trip the exhausted branch and wedge.
+    // The provider accepted this prompt and answered it, so context overflow is
+    // no longer consecutive even if the returned XML needs repair.
     session.consecutiveContextOverflows = 0;
+    const malformed = await sessionManager.handleMalformedOutput(session.sessionDbId, {
+      outputClass,
+      preview,
+      agentName,
+    });
+    session.consecutiveInvalidOutputs = malformed.retryCount;
 
-    // consecutiveInvalidOutputs is deliberately always 0 here (see worker-types),
-    // so logging it read as "the breaker is fine" on every rejection and hid
-    // #3800 for a full day of failures. Report the counter that can actually be
-    // non-zero instead.
-    logger.warn('PARSER', `${agentName} returned non-XML ${outputClass} response — ignoring queued batch`, {
+    logger.warn('PARSER', malformed.retry
+      ? `${agentName} returned non-XML ${outputClass} response — retrying queued batch with XML repair guidance`
+      : `${agentName} returned non-XML ${outputClass} response — retries exhausted; preserving batch for recovery`, {
       sessionId: session.sessionDbId,
       outputClass,
       preview,
       consecutiveContextOverflows: session.consecutiveContextOverflows,
     });
 
-    // Plain-text skip responses are intentionally ignored. Re-queueing them
-    // creates an observer loop where the same low-signal batch is retried.
-    await sessionManager.confirmClaimedMessages(session.sessionDbId);
-    session.earliestPendingTimestamp = null;
+    if (malformed.retry) {
+      session.conversationHistory.push({
+        role: 'user',
+        content: 'REPAIR REQUIRED: Your previous response was malformed. Return only valid XML matching the requested <observation> and/or <summary> schema. Do not include prose, Markdown fences, or explanations.',
+      });
+    }
     return;
   }
 

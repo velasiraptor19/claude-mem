@@ -490,7 +490,7 @@ export class ChromaSync {
     promptNumber: number,
     createdAtEpoch: number,
     platformSource?: string
-  ): Promise<void> {
+  ): Promise<{ expected: number; written: number; complete: boolean }> {
     const stored: StoredSummary = {
       id: summaryId,
       memory_session_id: memorySessionId,
@@ -527,6 +527,7 @@ export class ChromaSync {
         written
       });
     }
+    return { expected: documents.length, written, complete: written === documents.length };
   }
 
   private formatUserPromptDoc(prompt: StoredUserPrompt): ChromaDocument {

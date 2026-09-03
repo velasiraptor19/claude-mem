@@ -22,10 +22,11 @@ export interface SDKSession {
 }
 
 function observationSkeleton(mode: ModeConfig): string {
+  const exampleType = mode.observation_types[0]?.id ?? 'discovery';
   return `${mode.prompts.output_format_header}
 
 <observation>
-  <type>[ ${mode.observation_types.map(t => t.id).join(' | ')} ]</type>
+  <type>${exampleType}</type> <!-- choose exactly one: ${mode.observation_types.map(t => t.id).join(' | ')} -->
   <!--
     ${mode.prompts.type_guidance}
   -->
