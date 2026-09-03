@@ -12,13 +12,16 @@ import { groupByDate } from '../../../../shared/timeline-formatting.js';
 import { countObservationsByProjects } from '../../../context/ObservationCompiler.js';
 import { withObserverHealthWarning } from '../../../context/ContextBuilder.js';
 import { SettingsDefaultsManager } from '../../../../shared/SettingsDefaultsManager.js';
-import { USER_SETTINGS_PATH } from '../../../../shared/paths.js';
+import { USER_SETTINGS_PATH, getPackageRoot } from '../../../../shared/paths.js';
 import type { ObservationSearchResult, SessionSummarySearchResult } from '../../../sqlite/types.js';
 import { captureEvent } from '../../../telemetry/telemetry.js';
 import { telemetryBuffer } from '../../../telemetry/buffer.js';
 import { proTrialLine } from '../../../../shared/pro-promo.js';
 
-const ONBOARDING_EXPLAINER_PATH: string = path.resolve(__dirname, '../skills/how-it-works/onboarding-explainer.md');
+const ONBOARDING_EXPLAINER_PATH: string = path.join(
+  getPackageRoot(),
+  'skills/how-it-works/onboarding-explainer.md'
+);
 
 const cachedOnboardingExplainer: string | null = (() => {
   try {

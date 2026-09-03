@@ -130,6 +130,7 @@ describe('Claude setup-required generator gate', () => {
       claudeProvider as any,
       { startSession: async () => {} } as any,
       { startSession: async () => {} } as any,
+      { startSession: async () => {} } as any,
       {} as any,
       {} as any,
       {
@@ -191,5 +192,27 @@ describe('Claude setup-required generator gate', () => {
       kind: 'setup_required',
       remediation: expect.stringContaining('Claude Code CLI'),
     });
+  });
+
+  it('defers a subagent completion to canonical recovery instead of creating an unanchored job', async () => {
+    const routes = new SessionRoutes(
+      {} as any, {} as any, {} as any, {} as any, {} as any, {} as any,
+      {} as any, {} as any, {} as any,
+    );
+    let response: unknown;
+    const req = {
+      body: {
+        contentSessionId: 'child-session', agentId: 'agent-1', project: 'crawl4ai',
+        transcriptPath: '/root/.codex/sessions/child.jsonl',
+      },
+      query: {},
+      get: () => 'codex',
+    };
+    const res = { headersSent: false, json: (value: unknown) => { response = value; } };
+
+    (routes as any).handleSummarizeByClaudeId(req, res);
+    await Promise.resolve();
+
+    expect(response).toEqual({ status: 'deferred_to_canonical_recovery' });
   });
 });

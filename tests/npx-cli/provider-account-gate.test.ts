@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'bun:test';
 import { readFileSync } from 'fs';
 import { join } from 'path';
+import { providerNeedsAccount } from '../../src/npx-cli/commands/install.js';
 
 const source = readFileSync(
   join(__dirname, '..', '..', 'src', 'npx-cli', 'commands', 'install.ts'),
@@ -10,6 +11,10 @@ const source = readFileSync(
 describe('provider account gate', () => {
   it('exempts explicit claude and host installs from the account requirement', () => {
     expect(source).toContain("return provider !== 'claude' && provider !== 'host';");
+  });
+
+  it('exempts NVIDIA because its configured API key is the complete credential', () => {
+    expect(providerNeedsAccount('nvidia')).toBe(false);
   });
 
   it('still requires an account when no provider was named', () => {

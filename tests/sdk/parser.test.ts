@@ -23,7 +23,7 @@ function expectObservation(raw: string) {
 beforeEach(() => {
   const modeManager = ModeManager.getInstance() as unknown as { activeMode: unknown };
   modeManager.activeMode = {
-    observation_types: [{ id: 'bugfix' }, { id: 'discovery' }, { id: 'refactor' }],
+    observation_types: [{ id: 'bugfix' }, { id: 'discovery' }, { id: 'refactor' }, { id: 'change' }],
     observation_concepts: [],
   };
 });
@@ -146,7 +146,7 @@ describe('parseAgentXml — observations', () => {
     expect(result[0].type).toBe('bugfix');
   });
 
-  it('preserves a reporter-shaped unsupported observation type', () => {
+  it('falls back to the active mode default for unsupported observation types', () => {
     const xml = `<observation>
       <type>code</type>
       <title>Reporter-shaped unsupported type</title>
@@ -155,7 +155,60 @@ describe('parseAgentXml — observations', () => {
     const result = expectObservation(xml);
 
     expect(result).toHaveLength(1);
-    expect(result[0].type).toBe('code');
+    expect(result[0].type).toBe('bugfix');
+  });
+
+  it.each([
+    ['[change]', 'change'],
+    ['[**type**: discovery]', 'discovery'],
+    ['[**discovery**: inspected source]', 'discovery'],
+    ['patch', 'change'],
+    ['pattern', 'discovery'],
+    ['error', 'discovery'],
+  ])('normalizes NVIDIA-emitted type %s to %s', (rawType, expectedType) => {
+    const result = expectObservation(`<observation><type>${rawType}</type><title>Typed observation</title></observation>`);
+    expect(result[0].type).toBe(expectedType);
+  });
+
+  it.each([
+    ['[**title**: Worker confirmed healthy]', 'Worker confirmed healthy'],
+    ['[**title**: Worker confirmed healthy', 'Worker confirmed healthy'],
+    ['[**Discovery**]: Inspected parser source', 'Inspected parser source'],
+    ['[**discovery**: Inspected parser source]', 'Inspected parser source'],
+    ['[**feature**] Added recovery audit', 'Added recovery audit'],
+    ['[**title**:', null],
+  ])('normalizes NVIDIA title wrapper %s', (rawTitle, expectedTitle) => {
+    const result = expectObservation(`<observation><type>discovery</type><title>${rawTitle}</title><narrative>Companion semantic content</narrative></observation>`);
+    expect(result[0].title).toBe(expectedTitle);
+  });
+
+  it('normalizes matching NVIDIA field labels without stripping semantic Markdown labels', () => {
+    const result = expectObservation(`<observation>
+      <type>discovery</type>
+      <title>Parser inspection</title>
+      <subtitle>[**subtitle**: Confirmed XML label leakage]</subtitle>
+      <narrative>[**narrative**: The provider mirrors field labels into XML values.]</narrative>
+    </observation>`);
+    expect(result[0].subtitle).toBe('Confirmed XML label leakage');
+    expect(result[0].narrative).toBe('The provider mirrors field labels into XML values.');
+
+    const semantic = expectObservation(`<observation><type>discovery</type><title>Timeout</title><subtitle>[**timed_out**] Wait exceeded 60s</subtitle></observation>`);
+    expect(semantic[0].subtitle).toBe('[**timed_out**] Wait exceeded 60s');
+  });
+
+  it('omits NVIDIA field-label shells that contain no semantic content', () => {
+    const result = expectObservation(`<observation>
+      <type>discovery</type>
+      <title>[**title**:</title>
+      <subtitle>[**subtitle**:</subtitle>
+      <narrative>[**narrative**:]</narrative>
+      <facts><fact>Retain this real fact</fact></facts>
+    </observation>`);
+
+    expect(result[0].title).toBeNull();
+    expect(result[0].subtitle).toBeNull();
+    expect(result[0].narrative).toBeNull();
+    expect(result[0].facts).toEqual(['Retain this real fact']);
   });
 
   it('returns a fail-fast result when no observation/summary blocks are present', () => {
