@@ -99,6 +99,8 @@ export const codexAdapter: PlatformAdapter = {
       permissionMode: stringOrUndefined(r.permission_mode),
       model: stringOrUndefined(r.model),
       sessionSource,
+      agentId: stringOrUndefined(r.agent_id),
+      agentType: stringOrUndefined(r.agent_type),
     };
   },
 

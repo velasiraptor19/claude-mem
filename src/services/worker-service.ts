@@ -83,6 +83,7 @@ import { ClaudeProvider, classifyClaudeError } from './worker/ClaudeProvider.js'
 import type { WorkerRef } from './worker/agents/types.js';
 import { GeminiProvider, classifyGeminiError, isGeminiSelected, isGeminiAvailable } from './worker/GeminiProvider.js';
 import { OpenRouterProvider, classifyOpenRouterError, isOpenRouterSelected, isOpenRouterAvailable } from './worker/OpenRouterProvider.js';
+import { NvidiaProvider, isNvidiaSelected, isNvidiaAvailable } from './worker/NvidiaProvider.js';
 import { ClassifiedProviderError, isClassified, type ProviderErrorClass } from './worker/provider-errors.js';
 import { PaginationHelper } from './worker/PaginationHelper.js';
 import { SettingsManager } from './worker/SettingsManager.js';
@@ -91,6 +92,10 @@ import { FormattingService } from './worker/FormattingService.js';
 import { TimelineService } from './worker/TimelineService.js';
 import { SessionEventBroadcaster } from './worker/events/SessionEventBroadcaster.js';
 import { SessionCompletionHandler } from './worker/session/SessionCompletionHandler.js';
+import { RecoveryJobService } from './recovery/RecoveryJobService.js';
+import { RecoveryConsumer } from './recovery/RecoveryConsumer.js';
+import { HistoricalRecoveryScanner } from './recovery/HistoricalRecoveryScanner.js';
+import { RecoveryScannerScheduler } from './recovery/RecoveryScannerScheduler.js';
 import { setIngestContext, attachIngestGeneratorStarter } from './worker/http/shared.js';
 import { DEFAULT_CONFIG_PATH, DEFAULT_STATE_PATH, expandHomePath, filterNativeHookBackedCodexWatches, loadTranscriptWatchConfig } from './transcripts/config.js';
 import { TranscriptWatcher } from './transcripts/watcher.js';
@@ -107,6 +112,7 @@ import { MemoryRoutes } from './worker/http/routes/MemoryRoutes.js';
 import { CorpusRoutes } from './worker/http/routes/CorpusRoutes.js';
 import { ChromaRoutes } from './worker/http/routes/ChromaRoutes.js';
 import { CloudSyncRoutes } from './worker/http/routes/CloudSyncRoutes.js';
+import { RecoveryRoutes } from './worker/http/routes/RecoveryRoutes.js';
 
 import { CorpusStore } from './worker/knowledge/CorpusStore.js';
 import { CorpusBuilder } from './worker/knowledge/CorpusBuilder.js';
@@ -213,10 +219,14 @@ export class WorkerService implements WorkerRef {
   private sdkAgent: ClaudeProvider;
   private geminiAgent: GeminiProvider;
   private openRouterAgent: OpenRouterProvider;
+  private nvidiaAgent: NvidiaProvider;
   private paginationHelper: PaginationHelper;
   private settingsManager: SettingsManager;
   private sessionEventBroadcaster: SessionEventBroadcaster;
   private completionHandler: SessionCompletionHandler;
+  private recoveryJobs: RecoveryJobService | null = null;
+  private recoveryConsumer: RecoveryConsumer | null = null;
+  private recoveryScannerScheduler: RecoveryScannerScheduler | null = null;
   private corpusStore: CorpusStore;
 
   private searchRoutes: SearchRoutes | null = null;
@@ -245,6 +255,7 @@ export class WorkerService implements WorkerRef {
     this.sdkAgent = new ClaudeProvider(this.dbManager, this.sessionManager);
     this.geminiAgent = new GeminiProvider(this.dbManager, this.sessionManager);
     this.openRouterAgent = new OpenRouterProvider(this.dbManager, this.sessionManager);
+    this.nvidiaAgent = new NvidiaProvider(this.dbManager, this.sessionManager);
 
     this.paginationHelper = new PaginationHelper(this.dbManager);
     this.settingsManager = new SettingsManager(this.dbManager);
@@ -278,11 +289,12 @@ export class WorkerService implements WorkerRef {
       workerPath: __filename,
       getAiStatus: () => {
         let provider = 'claude';
-        if (isOpenRouterSelected() && isOpenRouterAvailable()) provider = 'openrouter';
+        if (isNvidiaSelected() && isNvidiaAvailable()) provider = 'nvidia';
+        else if (isOpenRouterSelected() && isOpenRouterAvailable()) provider = 'openrouter';
         else if (isGeminiSelected() && isGeminiAvailable()) provider = 'gemini';
         return {
           provider,
-          authMethod: getAuthMethodDescription(),
+          authMethod: providerAuthMethodDescription(provider),
           lastInteraction: this.lastAiInteraction
             ? {
                 timestamp: this.lastAiInteraction.timestamp,
@@ -352,7 +364,7 @@ export class WorkerService implements WorkerRef {
     });
 
     this.server.registerRoutes(new ViewerRoutes(this.sseBroadcaster, this.dbManager, this.sessionManager));
-    const sessionRoutes = new SessionRoutes(this.sessionManager, this.dbManager, this.sdkAgent, this.geminiAgent, this.openRouterAgent, this.sessionEventBroadcaster, this, this.completionHandler);
+    const sessionRoutes = new SessionRoutes(this.sessionManager, this.dbManager, this.sdkAgent, this.geminiAgent, this.openRouterAgent, this.nvidiaAgent, this.sessionEventBroadcaster, this, this.completionHandler);
     this.server.registerRoutes(sessionRoutes);
     attachIngestGeneratorStarter((sessionDbId, source) =>
       sessionRoutes.ensureGeneratorRunning(sessionDbId, source),
@@ -361,6 +373,7 @@ export class WorkerService implements WorkerRef {
     this.server.registerRoutes(new SettingsRoutes(this.settingsManager));
     this.server.registerRoutes(new LogsRoutes());
     this.server.registerRoutes(new MemoryRoutes(this.dbManager, 'claude-mem'));
+    this.server.registerRoutes(new RecoveryRoutes(this.dbManager, () => this.recoveryConsumer));
     this.server.registerRoutes(new ServerV1Routes({
       getDatabase: () => this.dbManager.getConnection(),
     }));
@@ -486,6 +499,37 @@ export class WorkerService implements WorkerRef {
 
       logger.info('WORKER', 'Initializing database manager...');
       await this.dbManager.initialize();
+
+      this.recoveryJobs = new RecoveryJobService(this.dbManager.getSessionStore());
+      this.sessionManager.setOnMalformedOutputExhausted(async (event) => {
+        const session = this.dbManager.getSessionById(event.sessionDbId);
+        const job = this.recoveryJobs!.enqueue({
+          contentSessionId: session.content_session_id,
+          recoveryKind: 'session_summary',
+          project: session.project,
+          platformSource: session.platform_source,
+          transcriptLocator: session.transcript_locator,
+          reason: `malformed_${event.outputClass}`,
+          sanitizedError: `Provider returned invalid summary output after ${event.retryCount} repair attempts: ${event.preview.slice(0, 240)}`,
+        });
+        logger.warn('SESSION', 'Queued malformed summary for durable recovery', {
+          recoveryJobId: job.id,
+          sessionId: event.sessionDbId,
+          contentSessionId: session.content_session_id,
+          project: session.project,
+          platformSource: session.platform_source,
+        });
+      });
+      if (isNvidiaSelected() && isNvidiaAvailable()) {
+        this.recoveryConsumer = new RecoveryConsumer(this.dbManager, this.nvidiaAgent);
+        this.recoveryConsumer.start();
+        this.recoveryScannerScheduler = new RecoveryScannerScheduler(() =>
+          new HistoricalRecoveryScanner(this.dbManager.getSessionStore(), undefined, undefined, 5 * 60_000).scan(false, 100),
+        );
+        this.recoveryScannerScheduler.start();
+      } else {
+        logger.warn('SESSION', 'Recovery consumer is paused until native NVIDIA is selected and configured');
+      }
 
       runOneTimeV12_4_3Cleanup();
 
@@ -791,6 +835,10 @@ export class WorkerService implements WorkerRef {
       isShuttingDown: () => this.isShuttingDown,
       markShuttingDown: () => { this.isShuttingDown = true; },
       beforeGracefulShutdown: async () => {
+        await this.recoveryScannerScheduler?.stop();
+        this.recoveryScannerScheduler = null;
+        await this.recoveryConsumer?.stop();
+        this.recoveryConsumer = null;
         if (this.transcriptWatcher) {
           this.transcriptWatcher.stop();
           this.transcriptWatcher = null;
@@ -1572,4 +1620,10 @@ if (isMainModule) {
     logger.error('SYSTEM', 'Fatal error in main', {}, error instanceof Error ? error : undefined);
     process.exit(0);  
   });
+}
+export function providerAuthMethodDescription(provider: string): string {
+  if (provider === 'nvidia') return 'NVIDIA API key';
+  if (provider === 'openrouter') return 'OpenRouter API key';
+  if (provider === 'gemini') return 'Gemini API key';
+  return getAuthMethodDescription();
 }

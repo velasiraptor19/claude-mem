@@ -8,7 +8,15 @@ interface BufferedMessage {
   id: number;
   message: PendingMessage;
   claimed: boolean;
+  recoveryPending: boolean;
   enqueuedAt: number;
+  malformedRetryCount: number;
+}
+
+export interface MalformedRetryResult {
+  retry: boolean;
+  retryCount: number;
+  messages: PendingMessageWithId[];
 }
 
 export interface DrainOptions {
@@ -64,7 +72,14 @@ export class SessionMessageBuffer {
     }
 
     const id = this.nextId++;
-    this.getList(sessionDbId).push({ id, message, claimed: false, enqueuedAt: Date.now() });
+    this.getList(sessionDbId).push({
+      id,
+      message,
+      claimed: false,
+      recoveryPending: false,
+      enqueuedAt: Date.now(),
+      malformedRetryCount: 0,
+    });
     this.onMutate?.();
     this.signal(sessionDbId);
     return id;
@@ -89,7 +104,7 @@ export class SessionMessageBuffer {
     if (!list) return 0;
     let reset = 0;
     for (const m of list) {
-      if (m.claimed) {
+      if (m.claimed && !m.recoveryPending) {
         m.claimed = false;
         reset++;
       }
@@ -99,6 +114,58 @@ export class SessionMessageBuffer {
       this.signal(sessionDbId);
     }
     return reset;
+  }
+
+  /**
+   * Record a malformed model response for exactly the claimed batch.
+   * The first `maxRetries` failures are released for another in-process pass.
+   * Once exhausted, messages remain buffered and claimed so they cannot form
+   * a hot retry loop or be silently confirmed before durable recovery exists.
+   */
+  recordMalformedClaim(
+    sessionDbId: number,
+    messageIds: number[],
+    maxRetries: number,
+  ): MalformedRetryResult {
+    const ids = new Set(messageIds);
+    const claimed = (this.buffers.get(sessionDbId) ?? []).filter(
+      message => ids.has(message.id) && message.claimed,
+    );
+
+    for (const message of claimed) {
+      message.malformedRetryCount++;
+    }
+
+    const retryCount = claimed.reduce(
+      (highest, message) => Math.max(highest, message.malformedRetryCount),
+      0,
+    );
+    const retry = claimed.length > 0 && retryCount <= maxRetries;
+
+    if (retry) {
+      for (const message of claimed) {
+        message.claimed = false;
+      }
+      this.signal(sessionDbId);
+    } else {
+      for (const message of claimed) {
+        message.recoveryPending = true;
+      }
+    }
+
+    if (claimed.length > 0) {
+      this.onMutate?.();
+    }
+
+    return {
+      retry,
+      retryCount,
+      messages: claimed.map(message => ({
+        ...message.message,
+        _persistentId: message.id,
+        _originalTimestamp: message.enqueuedAt,
+      })),
+    };
   }
 
   /** Drop everything buffered for a session. */
@@ -210,7 +277,7 @@ export class SessionMessageBuffer {
   private claimNext(sessionDbId: number): BufferedMessage | null {
     const list = this.buffers.get(sessionDbId);
     if (!list) return null;
-    const next = list.find(m => !m.claimed);
+    const next = list.find(m => !m.claimed && !m.recoveryPending);
     if (!next) return null;
     next.claimed = true;
     this.onMutate?.();

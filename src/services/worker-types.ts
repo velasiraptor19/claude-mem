@@ -2,7 +2,7 @@
 import type { Response } from 'express';
 
 export interface ConversationMessage {
-  role: 'user' | 'assistant';
+  role: 'system' | 'user' | 'assistant';
   content: string;
 }
 
@@ -22,7 +22,7 @@ export interface ActiveSession {
   earliestPendingTimestamp: number | null;  
   claimedMessageIds: number[];
   conversationHistory: ConversationMessage[];  
-  currentProvider: 'claude' | 'gemini' | 'openrouter' | null;
+  currentProvider: 'claude' | 'gemini' | 'openrouter' | 'nvidia' | null;
   consecutiveRestarts: number;
   /**
    * Legacy invalid-output counter. Ordinary non-XML observer output is now

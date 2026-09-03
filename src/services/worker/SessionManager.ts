@@ -11,6 +11,7 @@ export class SessionManager {
   private sessions: Map<number, ActiveSession> = new Map();
   private onPendingMutate?: () => void;
   private readonly buffer = new SessionMessageBuffer(() => this.onPendingMutate?.());
+  private onMalformedOutputExhausted?: (event: MalformedOutputExhaustedEvent) => void | Promise<void>;
 
   constructor(dbManager: DatabaseManager) {
     this.dbManager = dbManager;
@@ -18,6 +19,43 @@ export class SessionManager {
 
   setOnPendingMutate(cb: () => void): void {
     this.onPendingMutate = cb;
+  }
+
+  setOnMalformedOutputExhausted(
+    cb: (event: MalformedOutputExhaustedEvent) => void | Promise<void>,
+  ): void {
+    this.onMalformedOutputExhausted = cb;
+  }
+
+  async handleMalformedOutput(
+    sessionDbId: number,
+    details: Omit<MalformedOutputExhaustedEvent, 'sessionDbId' | 'messages' | 'retryCount'>,
+  ): Promise<{ retry: boolean; retryCount: number }> {
+    const session = this.sessions.get(sessionDbId);
+    const claimedIds = session?.claimedMessageIds ?? [];
+    const result = this.buffer.recordMalformedClaim(sessionDbId, claimedIds, 2);
+
+    if (session) {
+      session.claimedMessageIds = [];
+    }
+
+    if (!result.retry && result.messages.length > 0) {
+      try {
+        await this.onMalformedOutputExhausted?.({
+          sessionDbId,
+          retryCount: result.retryCount,
+          messages: result.messages,
+          ...details,
+        });
+      } catch (error) {
+        logger.error('SESSION', 'Malformed-output recovery hook failed; batch remains quarantined in memory', {
+          sessionId: sessionDbId,
+          retryCount: result.retryCount,
+        }, error instanceof Error ? error : new Error(String(error)));
+      }
+    }
+
+    return { retry: result.retry, retryCount: result.retryCount };
   }
 
   initializeSession(
@@ -392,4 +430,13 @@ export class SessionManager {
   getMessageBuffer(): SessionMessageBuffer {
     return this.buffer;
   }
+}
+
+export interface MalformedOutputExhaustedEvent {
+  sessionDbId: number;
+  outputClass: string;
+  preview: string;
+  agentName: string;
+  retryCount: number;
+  messages: PendingMessageWithId[];
 }
