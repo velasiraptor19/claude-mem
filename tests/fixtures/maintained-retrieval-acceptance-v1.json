@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "project": "claude-mem",
+  "dateEnd": "2026-09-02",
+  "topK": 5,
+  "cases": [
+    { "id": "lineage-dead-letter", "query": "lineage mismatch dead letter before NVIDIA", "expectedObservationId": 14762 },
+    { "id": "nvidia-byte-ceiling", "query": "UTF-8 byte input ceiling NVIDIA history", "expectedObservationId": 14763 },
+    { "id": "worker-stop-lease", "query": "worker stop lease release rollback", "expectedObservationId": 15800 },
+    { "id": "release-generation-fence", "query": "ReleaseWindow generation fence hook drain", "expectedObservationId": 15503 },
+    { "id": "shared-store-identity", "query": "StoreTopologyIdentity shared store UUID", "expectedObservationId": 16188 },
+    { "id": "release-identity", "query": "ReleaseIdentity build bundle manifest hashes doctor", "expectedObservationId": 17078 },
+    { "id": "codex-recovery", "query": "Codex transcript recovery fingerprint idempotent", "expectedObservationId": 14522 },
+    { "id": "historical-fingerprint", "query": "HistoricalFingerprintReconciler duplicate missing", "expectedObservationId": 15823 },
+    { "id": "subagent-lineage", "query": "subagent summary labeling parent child lineage", "expectedObservationId": 15271 },
+    { "id": "worktree-adoption", "query": "WorktreeAdoption dry run canonical project", "expectedObservationId": 16968 },
+    { "id": "recovery-job-lifecycle", "query": "recovery jobs enqueue lease retry cancel", "expectedObservationId": 14554 },
+    { "id": "completion-gap", "query": "session completion recovery gaps", "expectedObservationId": 14721 },
+    { "id": "nvidia-thinking", "query": "NVIDIA thinking false chat_template_kwargs", "expectedObservationId": 14705 },
+    { "id": "nvidia-rate-limit", "query": "NVIDIA rate limit RPM scheduling retry", "expectedObservationId": 14739 },
+    { "id": "evidence-repair", "query": "evidence IDs observation repair unsupported claims", "expectedObservationId": 14688 },
+    { "id": "canonical-disabled-window", "query": "canonical recovery disabled hook interval", "expectedObservationId": 15638 },
+    { "id": "single-writer", "query": "Chroma single writer lease root worker", "expectedObservationId": 15856 },
+    { "id": "manifest-attestation", "query": "manifest exact dependency tree approval hash", "expectedObservationId": 17086 },
+    { "id": "legacy-mcp-safety", "query": "legacy MCP process must not be killed", "expectedObservationId": 15388 },
+    { "id": "sqlite-snapshot", "query": "SQLite WAL SHM snapshot VACUUM INTO", "expectedObservationId": 15540 }
+  ]
+}
