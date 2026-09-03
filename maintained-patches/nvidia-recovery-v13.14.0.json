@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "upstreamVersion": "13.14.0",
+  "upstreamCommit": "de4930c0410ec9badb21dff98dd7bf409d5aac20",
+  "approvedBundleSha256": "ba03358102ba388261812050232a877b097659b713e16d7e3fc11a280001a8e6",
+  "files": {
+    "scripts/create-full-approval-manifest.cjs": "99785a3501f030a2eada3a31cfde96a90eb51bad5401911ba13b01b41e2cdbf7",
+    "scripts/sync-plugin-manifests.js": "af656800c7a45a88acff63ac9c94274c02b53533c00f5801a48709224848520f",
+    "scripts/verify-approved-manifest.cjs": "9135a6af2fec2d1e99c180babb38abe8225c8f55e18525045038f33fa559a0b4",
+    "scripts/write-build-attestation.cjs": "8642252ddb2581fb0aea0697507b6f88248d0c8eaa714f826641924ac2051dc5",
+    "src/services/infrastructure/WorktreeAdoption.ts": "5036e249a73339dfc97dbebbcaef50903e2058c8ca2650b61278f96cf1827f44",
+    "src/services/sync/ChromaSync.ts": "0647eefcc830f0ef349f0c684b75706c55f84fd418fd2ff65837b3ff499cd51c",
+    "src/services/worker-service.ts": "457570a2c2bd934767997cdb27ec3a3771145c68c9b19d694d68a82f1891413e",
+    "src/services/worker/http/routes/LogsRoutes.ts": "9462d3d6766fb2548eafd4a0a5f355afaa41a4f87c50cdb686fcc141a1492d29",
+    "src/services/worker/http/routes/WorktreeAdoptionRoutes.ts": "a8b82e5d4d94227c572b4b03a5fdc0f6f7357f68aaa4f868c06d709b90686cb3",
+    "src/utils/logger.ts": "beb464b5ded92c1c130dbc4bb0299c72c4970f1b78ce8e177e677700194f73ac",
+    "tests/services/infrastructure/worktree-adoption-chroma.test.ts": "6ea3cddc49199cfe5adbf0e5f4c747e484f0dab6e56a37c0fc848d64930874f3",
+    "tests/services/infrastructure/worktree-adoption-explicit.test.ts": "0358ac15da14e9eeb25c68f240d470d3ff37409b5024a946835425bf92e1bd2c",
+    "tests/services/logs-routes-tail-read.test.ts": "749f8d2e90d88ef6cd5a4448f00f7cd203d527a47fa830ea996c3327d1eab727",
+    "tests/services/worker/worktree-adoption-routes.test.ts": "dcfb7334fbd89ad300a0a44cbc91e1595f1d3bd0354e843c060a3c8e2bacf5c4"
+  },
+  "expectedFileCount": 14
+}

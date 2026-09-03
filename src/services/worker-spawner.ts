@@ -17,6 +17,7 @@ import {
 } from './infrastructure/HealthMonitor.js';
 import { acquireSpawnLock, releaseSpawnLock } from '../shared/worker-spawn-gate.js';
 import { isPidAlive } from '../supervisor/process-registry.js';
+import { ReleaseWindowManager } from './release/ReleaseWindow.js';
 
 const WINDOWS_SPAWN_COOLDOWN_MS = 2 * 60 * 1000;
 
@@ -73,6 +74,15 @@ export async function ensureWorkerStarted(
   port: number,
   workerScriptPath: string
 ): Promise<WorkerStartResult> {
+  // A managed release owns the sole writer. Hooks may still finish work that
+  // entered before detachment, but no caller may create a replacement worker
+  // while the durable generation fence is active.
+  // Only the maintained installer receives this single-use token.  Ordinary
+  // hooks never supply it, so they remain fenced for the full release window.
+  if (!new ReleaseWindowManager().canStartWorker(process.env.CLAUDE_MEM_MANAGED_START_AUTH)) {
+    logger.warn('SYSTEM', 'Worker start rejected while a managed release window is active');
+    return 'dead';
+  }
   if (!workerScriptPath) {
     logger.error('SYSTEM', 'ensureWorkerStarted called with empty workerScriptPath — caller bug');
     return 'dead';

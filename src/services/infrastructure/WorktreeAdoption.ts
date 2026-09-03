@@ -22,6 +22,8 @@ export interface AdoptionResult {
   chromaFailed: number;
   dryRun: boolean;
   errors: Array<{ worktree: string; error: string }>;
+  /** Durable Chroma metadata patches which have not yet been proven. */
+  chromaPending?: number;
 }
 
 /**
@@ -39,6 +41,14 @@ interface WorktreeEntry {
   branch: string | null;
 }
 
+/** A deliberately declared logical-project adoption source. */
+export interface DeclaredWorktreeSource {
+  /** Immutable provenance key currently stored on the rows. */
+  project: string;
+  /** Exact registered Git branch for that worktree. */
+  branch: string;
+}
+
 const GIT_TIMEOUT_MS = 15000;
 
 class DryRunRollback extends Error {
@@ -46,6 +56,60 @@ class DryRunRollback extends Error {
     super('dry-run rollback');
     this.name = 'DryRunRollback';
   }
+}
+
+/**
+ * Apply durable Chroma patches left by an earlier adoption attempt.  This is
+ * intentionally independent of discovery: a later worker boot can have no
+ * currently mergeable worktrees while SQLite still has a committed remap
+ * waiting for its vector metadata proof.
+ */
+async function reconcilePendingChromaOutbox(
+  dbPath: string,
+  parentProject: string,
+  result: AdoptionResult,
+): Promise<void> {
+  let pending: Array<{ patch_key: string; doc_type: 'observation' | 'session_summary'; sqlite_id: number }> = [];
+  let reconcileDb: import('bun:sqlite').Database | null = null;
+  try {
+    reconcileDb = openConfiguredSqliteDatabase(dbPath);
+    const outboxExists = reconcileDb.prepare(
+      "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'worktree_adoption_chroma_outbox'"
+    ).get();
+    if (!outboxExists) return;
+    pending = reconcileDb.prepare(`SELECT patch_key, doc_type, sqlite_id
+      FROM worktree_adoption_chroma_outbox WHERE status = 'pending' AND parent_project = ?
+      ORDER BY sqlite_id LIMIT 1000`).all(parentProject) as typeof pending;
+  } finally { reconcileDb?.close(); }
+
+  if (pending.length > 0) try {
+    const chromaSync = new ChromaSync('claude-mem');
+    const patched = await chromaSync.updateMergedIntoProject(pending.map(row => ({ docType: row.doc_type, sqliteId: row.sqlite_id })), parentProject);
+    if (patched !== pending.length) throw new Error(`Chroma proof incomplete: patched ${patched}/${pending.length} documents`);
+    const ackDb = openConfiguredSqliteDatabase(dbPath);
+    try {
+      const acknowledge = ackDb.prepare("UPDATE worktree_adoption_chroma_outbox SET status = 'applied', attempts = attempts + 1, last_error = NULL, updated_at_epoch = ? WHERE patch_key = ?");
+      ackDb.transaction(() => { for (const row of pending) acknowledge.run(Date.now(), row.patch_key); })();
+    } finally { ackDb.close(); }
+    result.chromaUpdates = patched;
+  } catch (err) {
+    logger.error(
+      'SYSTEM',
+      'Worktree adoption Chroma patch failed (SQL already committed)',
+      { parentProject, sqliteIdCount: pending.length },
+      err instanceof Error ? err : new Error(String(err))
+    );
+    result.chromaFailed = pending.length;
+    const failedDb = openConfiguredSqliteDatabase(dbPath);
+    try {
+      const fail = failedDb.prepare("UPDATE worktree_adoption_chroma_outbox SET attempts = attempts + 1, last_error = ?, updated_at_epoch = ? WHERE patch_key = ?");
+      failedDb.transaction(() => { for (const row of pending) fail.run(err instanceof Error ? err.message : String(err), Date.now(), row.patch_key); })();
+    } finally { failedDb.close(); }
+  }
+
+  const countDb = openConfiguredSqliteDatabase(dbPath);
+  try { result.chromaPending = (countDb.prepare("SELECT COUNT(*) AS n FROM worktree_adoption_chroma_outbox WHERE status = 'pending' AND parent_project = ?").get(parentProject) as { n: number }).n; }
+  finally { countDb.close(); }
 }
 
 function gitCapture(cwd: string, args: string[]): string | null {
@@ -134,6 +198,10 @@ export async function adoptMergedWorktrees(opts: {
   dataDirectory?: string;
   dryRun?: boolean;
   onlyBranch?: string;
+  // Internal escape hatch used only after adoptDeclaredWorktrees validates
+  // every pair against `git worktree list`. It deliberately cannot supply a
+  // parent target: the target always derives from the main repository.
+  declaredSources?: DeclaredWorktreeSource[];
 } = {}): Promise<AdoptionResult> {
   const dataDirectory = opts.dataDirectory ?? DEFAULT_DATA_DIR;
   const dryRun = opts.dryRun ?? false;
@@ -171,11 +239,26 @@ export async function adoptMergedWorktrees(opts: {
   result.scannedWorktrees = childWorktrees.length;
 
   if (childWorktrees.length === 0) {
+    if (!dryRun) await reconcilePendingChromaOutbox(dbPath, parentProject, result);
     return result;
   }
 
   let targets: WorktreeEntry[];
-  if (opts.onlyBranch) {
+  if (opts.declaredSources) {
+    targets = opts.declaredSources.map(source => {
+      const worktree = childWorktrees.find(candidate =>
+        candidate.branch === source.branch &&
+        getProjectContext(candidate.path).primary === source.project
+      );
+      if (!worktree) {
+        // This is defense in depth. The public explicit entrypoint performs
+        // this check before opening SQLite, and no caller can nominate a
+        // target parent through this internal option.
+        throw new Error(`Declared source is not a registered worktree: ${source.project} (${source.branch})`);
+      }
+      return worktree;
+    });
+  } else if (opts.onlyBranch) {
     targets = childWorktrees.filter(w => w.branch === opts.onlyBranch);
   } else {
     const merged = listMergedBranches(mainRepo);
@@ -187,6 +270,7 @@ export async function adoptMergedWorktrees(opts: {
     .filter((b): b is string => b !== null);
 
   if (targets.length === 0) {
+    if (!dryRun) await reconcilePendingChromaOutbox(dbPath, parentProject, result);
     return result;
   }
 
@@ -213,6 +297,22 @@ export async function adoptMergedWorktrees(opts: {
       );
       return result;
     }
+
+    // SQLite is canonical.  The Chroma mutation is deliberately represented
+    // here, in the same transaction as the logical-project remap, so a crash
+    // can never leave an adopted row without a deterministic retry record.
+    if (!dryRun) db.run(`CREATE TABLE IF NOT EXISTS worktree_adoption_chroma_outbox (
+      patch_key TEXT PRIMARY KEY,
+      source_project TEXT NOT NULL,
+      parent_project TEXT NOT NULL,
+      doc_type TEXT NOT NULL CHECK(doc_type IN ('observation','session_summary')),
+      sqlite_id INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','applied')),
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      updated_at_epoch INTEGER NOT NULL
+    )`);
+    if (!dryRun) db.run('CREATE INDEX IF NOT EXISTS idx_worktree_adoption_chroma_pending ON worktree_adoption_chroma_outbox(status, parent_project)');
 
     const selectObsForPatch = db.prepare(
       `SELECT id FROM observations
@@ -266,9 +366,17 @@ export async function adoptMergedWorktrees(opts: {
       }
       for (const r of rows) {
         adoptedChromaTargets.push({ docType: 'observation', sqliteId: r.id });
+        if (!dryRun) db!.prepare(`INSERT OR IGNORE INTO worktree_adoption_chroma_outbox
+          (patch_key, source_project, parent_project, doc_type, sqlite_id, updated_at_epoch)
+          VALUES (?, ?, ?, 'observation', ?, ?)`).run(
+          `observation:${worktreeProject}:${parentProject}:${r.id}`, worktreeProject, parentProject, r.id, Date.now());
       }
       for (const r of summaryRows) {
         adoptedChromaTargets.push({ docType: 'session_summary', sqliteId: r.id });
+        if (!dryRun) db!.prepare(`INSERT OR IGNORE INTO worktree_adoption_chroma_outbox
+          (patch_key, source_project, parent_project, doc_type, sqlite_id, updated_at_epoch)
+          VALUES (?, ?, ?, 'session_summary', ?, ?)`).run(
+          `session_summary:${worktreeProject}:${parentProject}:${r.id}`, worktreeProject, parentProject, r.id, Date.now());
       }
       result.adoptedObservations += obsChanges;
       result.adoptedSummaries += sumChanges;
@@ -276,6 +384,13 @@ export async function adoptMergedWorktrees(opts: {
 
     const tx = db.transaction(() => {
       for (const wt of targets) {
+        // A declared logical adoption is an operator-specified unit: every
+        // declared source must remap, or none of its SQL changes may commit.
+        // Automatic discovery retains its historical best-effort behavior.
+        if (opts.declaredSources) {
+          adoptWorktreeInTransaction(wt);
+          continue;
+        }
         try {
           adoptWorktreeInTransaction(wt);
         } catch (err) {
@@ -310,29 +425,7 @@ export async function adoptMergedWorktrees(opts: {
     db?.close();
   }
 
-  if (!dryRun && adoptedChromaTargets.length > 0) {
-    const chromaSync = new ChromaSync('claude-mem');
-    try {
-      await chromaSync.updateMergedIntoProject(adoptedChromaTargets, parentProject);
-      result.chromaUpdates = adoptedChromaTargets.length;
-    } catch (err) {
-      if (err instanceof Error) {
-        logger.error(
-          'SYSTEM',
-          'Worktree adoption Chroma patch failed (SQL already committed)',
-          { parentProject, sqliteIdCount: adoptedChromaTargets.length },
-          err
-        );
-      } else {
-        logger.error(
-          'SYSTEM',
-          'Worktree adoption Chroma patch failed (SQL already committed)',
-          { parentProject, sqliteIdCount: adoptedChromaTargets.length, error: String(err) }
-        );
-      }
-      result.chromaFailed = adoptedChromaTargets.length;
-    }
-  }
+  if (!dryRun) await reconcilePendingChromaOutbox(dbPath, parentProject, result);
 
   if (
     result.adoptedObservations > 0 ||
@@ -354,6 +447,73 @@ export async function adoptMergedWorktrees(opts: {
   }
 
   return result;
+}
+
+/**
+ * Adopt explicitly declared worktree projects without consulting Git's
+ * merged-branch graph. This is intentionally narrow: the destination must be
+ * the exact project name derived from the main repository and every source
+ * must match one registered worktree path AND branch. Row provenance
+ * (`project`) remains immutable; only `merged_into_project` is remapped.
+ */
+export async function adoptDeclaredWorktrees(opts: {
+  repoPath?: string;
+  dataDirectory?: string;
+  dryRun?: boolean;
+  parentProject: string;
+  sources: DeclaredWorktreeSource[];
+}): Promise<AdoptionResult> {
+  const startCwd = opts.repoPath ?? process.cwd();
+  const mainRepo = resolveMainRepoPath(startCwd);
+  if (!mainRepo) {
+    throw new Error(`Explicit worktree adoption requires a registered Git repository: ${startCwd}`);
+  }
+
+  const derivedParent = getProjectContext(mainRepo).primary;
+  if (!isExactProjectName(opts.parentProject) || opts.parentProject.includes('/') || opts.parentProject !== derivedParent) {
+    throw new Error(`--parent-project must exactly match this repository's parent project: ${derivedParent}`);
+  }
+  if (!Array.isArray(opts.sources) || opts.sources.length === 0) {
+    throw new Error('Explicit worktree adoption requires at least one --source-project/--branch pair');
+  }
+
+  const registered = listWorktrees(mainRepo).filter(worktree => worktree.path !== mainRepo);
+  const seen = new Set<string>();
+  for (const source of opts.sources) {
+    if (!isExactProjectName(source.project) || !isExactBranchName(source.branch)) {
+      throw new Error('Declared source project and branch must be non-blank exact values');
+    }
+    if (!source.project.startsWith(`${derivedParent}/`)) {
+      throw new Error(`Declared source project is not a child of ${derivedParent}: ${source.project}`);
+    }
+    const key = `${source.project}\u0000${source.branch}`;
+    if (seen.has(key)) {
+      throw new Error(`Duplicate declared source: ${source.project} (${source.branch})`);
+    }
+    seen.add(key);
+    const match = registered.find(worktree =>
+      worktree.branch === source.branch &&
+      getProjectContext(worktree.path).primary === source.project
+    );
+    if (!match) {
+      throw new Error(`Declared source is not a registered worktree: ${source.project} (${source.branch})`);
+    }
+  }
+
+  return adoptMergedWorktrees({
+    repoPath: mainRepo,
+    dataDirectory: opts.dataDirectory,
+    dryRun: opts.dryRun,
+    declaredSources: opts.sources,
+  });
+}
+
+function isExactProjectName(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value === value.trim() && !/[\u0000-\u001f]/.test(value);
+}
+
+function isExactBranchName(value: unknown): value is string {
+  return isExactProjectName(value) && !value.startsWith('-');
 }
 
 export async function adoptMergedWorktreesForAllKnownRepos(opts: {

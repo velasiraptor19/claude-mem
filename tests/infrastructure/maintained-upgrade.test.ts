@@ -1,0 +1,413 @@
+import { describe, expect, it } from 'bun:test';
+import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'fs';
+import { spawnSync } from 'child_process';
+import path from 'path';
+
+const root = path.resolve(import.meta.dir, '../..');
+const scriptPath = path.join(root, 'scripts/maintained-upgrade.sh');
+
+const freshShellReconciliationPhases = [
+  'worker_quiesced',
+  'snapshot_ready',
+  'artifact_installed',
+  'worker_attested',
+  'hooks_attached',
+] as const;
+
+type FreshShellReconciliationPhase = (typeof freshShellReconciliationPhases)[number];
+
+function expectFreshShellReconciliation(phase: FreshShellReconciliationPhase) {
+  const fixture = path.join('/tmp', `claude-mem-reconcile-${phase}-${process.pid}-${Date.now()}`);
+  const backup = path.join(fixture, 'backups', 'receipt');
+  mkdirSync(backup, { recursive: true });
+  const home = path.join(fixture, 'home');
+  const oldWorker = path.join(home, '.claude/plugins/cache/thedotmack/claude-mem/13.14.0/scripts/worker-service.cjs');
+  const target = path.join(home, '.claude/plugins/cache/thedotmack/claude-mem/13.14.1');
+  mkdirSync(path.dirname(oldWorker), { recursive: true });
+  writeFileSync(oldWorker, '// fake managed worker\n');
+  const presence = path.join(backup, 'presence'); mkdirSync(path.join(backup, 'targets'), { recursive: true }); mkdirSync(path.join(backup, 'metadata'), { recursive: true }); mkdirSync(presence);
+  const markAbsent = (item: string) => writeFileSync(path.join(presence, require('crypto').createHash('sha256').update(item).digest('hex')), 'absent');
+  if (phase !== 'worker_quiesced') {
+    writeFileSync(path.join(backup, 'database-snapshot-state'), 'absent\n');
+    for (const item of [target, path.join(home, '.claude/plugins/installed_plugins.json'), path.join(home, '.claude/plugins/known_marketplaces.json'), path.join(fixture, 'settings.json'), path.join(fixture, 'build-attestation-v1.json'), path.join(fixture, 'chroma')]) markAbsent(item);
+  }
+  // The durable receipt remains snapshot_ready while each target is
+  // replaced, so a crash in that loop must restore this partial target.
+  if (['snapshot_ready', 'artifact_installed', 'worker_attested', 'hooks_attached'].includes(phase)) {
+    mkdirSync(target, { recursive: true });
+    writeFileSync(path.join(target, 'replacement-asset'), 'must be removed by rollback\n');
+  }
+  const bin = path.join(fixture, 'bin'); mkdirSync(bin);
+  writeFileSync(path.join(bin, 'bun'), `#!/usr/bin/env bash\ntouch ${JSON.stringify(path.join(fixture, 'started'))}\n`);
+  writeFileSync(path.join(bin, 'curl'), `#!/usr/bin/env bash\nif [[ -f ${JSON.stringify(path.join(fixture, 'started'))} ]]; then printf %s ${JSON.stringify(JSON.stringify({ status: 'ok', version: '13.14.0', workerPath: oldWorker }))}; exit 0; fi\nexit 7\n`);
+  require('fs').chmodSync(path.join(bin, 'bun'), 0o755); require('fs').chmodSync(path.join(bin, 'curl'), 0o755);
+  writeFileSync(path.join(fixture, 'release-transaction-v1.json'), JSON.stringify({ schemaVersion: 1, id: 'receipt', generation: 9, phase, backupDir: backup, oldWorkerPath: oldWorker, oldVersion: '13.14.0', quiescedWorkerPid: 999999, targets: [target] }));
+  writeFileSync(path.join(fixture, 'release-window-v1.json'), JSON.stringify({ schemaVersion: 1, id: 'window', generation: 9, phase, startedAt: new Date().toISOString(), updatedAt: new Date().toISOString(), hookDrainAcknowledged: true, recoveryBounds: { startedAt: new Date().toISOString() } }));
+  const run = spawnSync('bash', [scriptPath, 'reconcile'], { cwd: root, encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, CLAUDE_MEM_UPGRADE_HOME: home, CLAUDE_MEM_DATA_DIR: fixture, CLAUDE_MEM_HEALTH_URL: 'http://127.0.0.1:1/api/health', CLAUDE_MEM_UPGRADE_SKIP_CHECKS: '1' } });
+  expect(run.status).toBe(0);
+  expect(JSON.parse(readFileSync(path.join(fixture, 'release-window-v1.json'), 'utf8')).phase).toBe('failed');
+  expect(JSON.parse(run.stdout).operation).toBe(phase === 'worker_quiesced' ? 'resume_snapshot' : 'rollback');
+  expect(readFileSync(path.join(fixture, 'release-transaction-v1.json'), 'utf8')).toContain('complete');
+  if (['snapshot_ready', 'artifact_installed', 'worker_attested', 'hooks_attached'].includes(phase)) expect(() => readFileSync(path.join(target, 'replacement-asset'), 'utf8')).toThrow();
+  rmSync(fixture, { recursive: true, force: true });
+}
+
+describe('maintained upgrade safety', () => {
+  it('rejects scoped Phase-1A approval before any installer state or staging path is touched', () => {
+    const fixture = path.join('/tmp', `claude-mem-scoped-upgrade-${process.pid}-${Date.now()}`);
+    const home = path.join(fixture, 'home');
+    const data = path.join(fixture, 'data');
+    const run = spawnSync('bash', [scriptPath, 'install'], {
+      cwd: root,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        CLAUDE_MEM_APPROVAL_SCOPE: 'phase-1a',
+        CLAUDE_MEM_UPGRADE_HOME: home,
+        CLAUDE_MEM_DATA_DIR: data,
+        CLAUDE_MEM_UPGRADE_SKIP_CHECKS: '1',
+      },
+    });
+    expect(run.status).toBe(2);
+    expect(run.stderr).toContain('scoped Phase-1A approval is non-deploying');
+    for (const untouched of [
+      home,
+      data,
+      path.join(data, '.maintained-upgrade.lock'),
+      path.join(data, 'release-window-v1.json'),
+      path.join(data, 'release-transaction-v1.json'),
+      path.join(data, 'backups'),
+      path.join(home, '.claude/plugins/marketplaces/thedotmack'),
+    ]) expect(existsSync(untouched)).toBe(false);
+    rmSync(fixture, { recursive: true, force: true });
+  });
+
+  it('keeps full approval on the managed installer path', () => {
+    const source = readFileSync(scriptPath, 'utf8');
+    const fullManifest = source.indexOf('full) manifest=');
+    const scopedGuard = source.indexOf('scoped Phase-1A approval is non-deploying');
+    const installerLock = source.indexOf('installer_lock="$data_dir/.maintained-upgrade.lock"');
+    expect(fullManifest).toBeGreaterThan(-1);
+    expect(scopedGuard).toBeGreaterThan(fullManifest);
+    expect(installerLock).toBeGreaterThan(scopedGuard);
+  });
+
+  it('accepts the complete approved manifest for a side-effect-free dry run', () => {
+    const fixture = path.join('/tmp', `claude-mem-upgrade-dry-run-${process.pid}-${Date.now()}`);
+    const home = path.join(fixture, 'home');
+    const data = path.join(fixture, 'data');
+    const manifestPath = path.join(root, 'maintained-patches/nvidia-recovery-v13.14.0.json');
+    const originalManifest = readFileSync(manifestPath, 'utf8');
+    const fixtureManifest = JSON.parse(originalManifest);
+    try {
+      expect(fixtureManifest.expectedFileCount).toBe(14);
+      expect(Object.keys(fixtureManifest.files)).toHaveLength(14);
+      writeFileSync(manifestPath, `${JSON.stringify(fixtureManifest, null, 2)}\n`);
+      const run = spawnSync('bash', [scriptPath, 'dry-run'], {
+        cwd: root, encoding: 'utf8',
+        env: { ...process.env, CLAUDE_MEM_UPGRADE_HOME: home, CLAUDE_MEM_DATA_DIR: data, CLAUDE_MEM_UPGRADE_SKIP_CHECKS: '1' },
+      });
+      expect(run.status).toBe(0);
+      expect(run.stdout).toContain('PLAN stop worker');
+      for (const untouched of [
+        home,
+        path.join(data, '.maintained-upgrade.lock'),
+        path.join(data, 'backups'),
+        path.join(data, 'release-window-v1.json'),
+        path.join(data, 'release-transaction-v1.json'),
+        path.join(data, 'build-attestation-v1.json'),
+        path.join(data, 'chroma'),
+      ]) expect(existsSync(untouched)).toBe(false);
+    } finally {
+      writeFileSync(manifestPath, originalManifest);
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a tampered full-manifest hash before dry-run deployment work', () => {
+    const fixture = path.join('/tmp', `claude-mem-upgrade-tampered-manifest-${process.pid}-${Date.now()}`);
+    const home = path.join(fixture, 'home');
+    const data = path.join(fixture, 'data');
+    const manifestPath = path.join(root, 'maintained-patches/nvidia-recovery-v13.14.0.json');
+    const originalManifest = readFileSync(manifestPath, 'utf8');
+    const tamperedManifest = JSON.parse(originalManifest);
+    tamperedManifest.files['scripts/create-full-approval-manifest.cjs'] = '0'.repeat(64);
+    try {
+      writeFileSync(manifestPath, `${JSON.stringify(tamperedManifest, null, 2)}\n`);
+      const run = spawnSync('bash', [scriptPath, 'dry-run'], {
+        cwd: root, encoding: 'utf8',
+        env: { ...process.env, CLAUDE_MEM_UPGRADE_HOME: home, CLAUDE_MEM_DATA_DIR: data, CLAUDE_MEM_UPGRADE_SKIP_CHECKS: '1' },
+      });
+      expect(run.status).toBe(3);
+      expect(run.stderr).toContain('manifest verification failed: manifest hash mismatch: scripts/create-full-approval-manifest.cjs');
+      for (const untouched of [
+        home,
+        path.join(data, '.maintained-upgrade.lock'),
+        path.join(data, 'backups'),
+        path.join(data, 'release-window-v1.json'),
+        path.join(data, 'release-transaction-v1.json'),
+      ]) expect(existsSync(untouched)).toBe(false);
+    } finally {
+      writeFileSync(manifestPath, originalManifest);
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
+  it('rollback stops and verifies the worker before restoring any durable state', () => {
+    const source = readFileSync(scriptPath, 'utf8');
+    const rollback = source.slice(source.indexOf('rollback() {'), source.indexOf('\n}\n\nhealth_json='));
+    const stop = rollback.indexOf('stop_worker ||');
+    expect(stop).toBeGreaterThan(0);
+    for (const restore of ['rm -rf -- "$target"', 'settings.json" "$data_dir/settings.json', 'restore_database ||', 'rm -rf -- "$data_dir/chroma']) {
+      expect(rollback.indexOf(restore)).toBeGreaterThan(stop);
+    }
+    expect(rollback.indexOf('start_and_verify_version')).toBeGreaterThan(rollback.indexOf('rm -rf -- "$data_dir/chroma'));
+    expect(rollback.indexOf('rolling_back')).toBeLessThan(stop);
+    const restoreDb = source.slice(source.indexOf('restore_database() {'), source.indexOf('\n}\nrollback() {'));
+    const restoreSidecars = restoreDb.indexOf('rm -f -- "$data_dir/claude-mem.db-wal" "$data_dir/claude-mem.db-shm"');
+    const restoreDatabase = restoreDb.indexOf('mv -f -- "$rollback_db_stage" "$data_dir/claude-mem.db"');
+    const releaseFailed = rollback.lastIndexOf('release-window.cjs" fail');
+    expect(restoreDb.indexOf('validate_sqlite_snapshot "$rollback_db_stage"')).toBeGreaterThan(0);
+    expect(restoreSidecars).toBeGreaterThan(restoreDb.indexOf('validate_sqlite_snapshot "$rollback_db_stage"'));
+    expect(restoreDatabase).toBeGreaterThan(restoreSidecars);
+    expect(releaseFailed).toBeGreaterThan(restoreDatabase);
+    const releaseSequence = source.slice(source.indexOf('node "$repo_dir/scripts/release-window.cjs" begin'));
+    expect(releaseSequence.indexOf('hooks_drained')).toBeLessThan(releaseSequence.indexOf('stop_worker'));
+    expect(releaseSequence.indexOf('stop_worker')).toBeLessThan(releaseSequence.indexOf('worker_quiesced'));
+    const install = source.slice(source.indexOf('old_version='));
+    expect(install.indexOf('stop_worker')).toBeLessThan(install.indexOf('cp -a "$data_dir/chroma"'));
+    expect(install.indexOf('mkdir -p "$(dirname "$target")"')).toBeLessThan(install.indexOf('mktemp -d'));
+    expect(source).toContain('runtime_root="$(dirname "$staged_bundle")/.."');
+    expect(source).toContain("--exclude='node_modules'");
+    expect(source).toContain('rsync -aL --delete "$repo_dir/node_modules/" "$stage/node_modules/"');
+    expect(source).toContain('ui/viewer.html');
+    expect(source).toContain('skills/how-it-works/onboarding-explainer.md');
+    expect(source).toContain('.claude/plugins/cache/thedotmack/claude-mem/$expected_version/scripts/worker-service.cjs');
+    expect(source).toContain("path.join(target, '.install-version')");
+    expect(source).toContain('write_install_marker "$home_dir/.claude/plugins/marketplaces/thedotmack"');
+    expect(source).toContain('write_install_marker "$home_dir/.codex/plugins/cache/claude-mem-local/claude-mem/$expected_version"');
+    expect(source).toContain('worker did not fully stop; refusing state restore');
+    expect(source).toContain('kill -0 "$running_pid"');
+    expect(source).toContain('validate_sqlite_snapshot "$rollback_db_stage"');
+    expect(source).toContain('database-snapshot-state');
+    expect(source).toContain('snapshot_complete=0');
+    expect(source).toContain('trap on_failure ERR');
+    expect(source).toContain("trap 'on_interrupt 130' INT");
+    expect(source).toContain("trap 'on_interrupt 143' TERM");
+    expect(source).toContain('write-build-attestation.cjs');
+    expect(source).toContain('build-attestation-v1.json');
+    expect(source).toContain('release-window.cjs');
+    expect(source).toContain('installer_lock="$data_dir/.maintained-upgrade.lock"');
+    expect(source).toContain('validate_managed_worker_path "$old_worker_path"');
+    expect(source).toContain('worker-service entrypoint');
+    expect(source).toContain('"$root/"*/scripts/worker-service.cjs');
+    expect(source).toContain('hooks_drained');
+    expect(source).toContain('managed_start_token');
+    expect(source).toContain('assert_lease_aware_old_worker "$old_worker_path"');
+    expect(source.indexOf('assert_lease_aware_old_worker "$old_worker_path"')).toBeLessThan(source.indexOf('release-window.cjs" begin'));
+    expect(source).toContain('replacement_started=0');
+    expect(source.indexOf('reconcile_interrupted_release\nvalidate_source')).toBeGreaterThan(0);
+    expect(source.indexOf('reconcile_interrupted_release\nvalidate_source')).toBeLessThan(source.indexOf('release-window.cjs" hooks_attached'));
+    // Every paired transaction/window transition commits recovery evidence
+    // first, so fault injection between the two writes is recoverable.
+    for (const phase of ['snapshot_ready', 'artifact_installed', 'worker_attested', 'hooks_attached']) {
+      const receipt = `release-transaction.cjs" phase "$data_dir" ${phase}`;
+      const window = `release-window.cjs" ${phase} "$data_dir"`;
+      expect(releaseSequence.indexOf(receipt)).toBeLessThan(releaseSequence.indexOf(window));
+    }
+    const rollbackValidation = rollback.indexOf('prevalidate_reconcile_restore "$backup_dir"');
+    expect(rollbackValidation).toBeGreaterThan(0);
+    expect(rollbackValidation).toBeLessThan(rollback.indexOf('release-window.cjs" rolling_back'));
+    expect(rollbackValidation).toBeLessThan(stop);
+  });
+
+  it('uses an exclusive installer lock in an isolated data fixture', () => {
+    const fixture = path.join('/tmp', `claude-mem-upgrade-lock-${process.pid}-${Date.now()}`);
+    const lock = path.join(fixture, '.maintained-upgrade.lock');
+    // Exercise the same primitive used by the script, without invoking its
+    // source/manifest validation or any user-owned path.
+    const create = spawnSync('mkdir', ['-p', fixture]);
+    expect(create.status).toBe(0);
+    expect(spawnSync('mkdir', [lock]).status).toBe(0);
+    expect(spawnSync('mkdir', [lock]).status).not.toBe(0);
+    rmSync(fixture, { recursive: true, force: true });
+  });
+
+  it('takes the reconciliation lock before inspecting a fresh maintenance fence', () => {
+    const fixture = path.join('/tmp', `claude-mem-reconcile-lock-${process.pid}-${Date.now()}`);
+    mkdirSync(path.join(fixture, '.maintained-upgrade.lock'), { recursive: true });
+    writeFileSync(path.join(fixture, 'release-window-v1.json'), JSON.stringify({ schemaVersion: 1, generation: 9, phase: 'worker_quiesced' }));
+    const run = spawnSync('bash', [scriptPath, 'reconcile'], { cwd: root, encoding: 'utf8', env: { ...process.env, CLAUDE_MEM_UPGRADE_HOME: path.join(fixture, 'home'), CLAUDE_MEM_DATA_DIR: fixture, CLAUDE_MEM_UPGRADE_SKIP_CHECKS: '1' } });
+    expect(run.status).toBe(4);
+    expect(JSON.parse(readFileSync(path.join(fixture, 'release-window-v1.json'), 'utf8')).phase).toBe('worker_quiesced');
+    rmSync(fixture, { recursive: true, force: true });
+  });
+
+  it('rejects a legacy hook already in flight before creating a maintenance fence', () => {
+    const fixture = path.join('/tmp', `claude-mem-legacy-hook-upgrade-${process.pid}-${Date.now()}`);
+    const home = path.join(fixture, 'home');
+    const data = path.join(fixture, 'data');
+    const oldWorker = path.join(home, '.claude/plugins/cache/thedotmack/claude-mem/13.13.0/scripts/worker-service.cjs');
+    const inFlight = path.join(fixture, 'legacy-hook-in-flight');
+    mkdirSync(path.dirname(oldWorker), { recursive: true });
+    // This deliberately lacks the durable lease protocol. It models an old
+    // hook process that may still be about to write when an upgrade begins.
+    writeFileSync(oldWorker, '/* legacy hook worker: may write after detach */\n');
+    writeFileSync(inFlight, 'legacy hook has not been forcibly interrupted\n');
+    const run = spawnSync('bash', [scriptPath, 'probe-hook-fence', oldWorker], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, CLAUDE_MEM_UPGRADE_HOME: home, CLAUDE_MEM_DATA_DIR: data, CLAUDE_MEM_UPGRADE_SKIP_CHECKS: '1' },
+    });
+    expect(run.status).not.toBe(0);
+    expect(run.stderr).toContain('legacy/non-lease-aware installed hook worker');
+    expect(readFileSync(inFlight, 'utf8')).toContain('has not been forcibly interrupted');
+    expect(() => readFileSync(path.join(data, 'release-window-v1.json'), 'utf8')).toThrow();
+    rmSync(fixture, { recursive: true, force: true });
+  });
+
+  it('prevalidates corrupt snapshots and malicious old workers before deleting reconciliation targets', () => {
+    for (const kind of ['missing-db', 'corrupt-db', 'malicious-worker']) {
+      const fixture = path.join('/tmp', `claude-mem-reconcile-prevalidate-${kind}-${process.pid}-${Date.now()}`);
+      const backup = path.join(fixture, 'backups', 'receipt'); const home = path.join(fixture, 'home'); const target = path.join(home, '.claude/plugins/cache/thedotmack/claude-mem/13.14.1');
+      const presence = path.join(backup, 'presence'); mkdirSync(path.join(backup, 'targets'), { recursive: true }); mkdirSync(path.join(backup, 'metadata'), { recursive: true }); mkdirSync(presence); mkdirSync(target, { recursive: true });
+      const mark = (item: string, state = 'absent') => writeFileSync(path.join(presence, require('crypto').createHash('sha256').update(item).digest('hex')), state);
+      for (const item of [target, path.join(home, '.claude/plugins/installed_plugins.json'), path.join(home, '.claude/plugins/known_marketplaces.json'), path.join(fixture, 'settings.json'), path.join(fixture, 'build-attestation-v1.json'), path.join(fixture, 'chroma')]) mark(item);
+      writeFileSync(path.join(target, 'replacement-asset'), 'must remain behind the fence\n');
+      const worker = kind === 'malicious-worker' ? path.join(fixture, 'outside-worker-service.cjs') : path.join(home, '.claude/plugins/cache/thedotmack/claude-mem/13.14.0/scripts/worker-service.cjs');
+      mkdirSync(path.dirname(worker), { recursive: true }); writeFileSync(worker, '// worker\n');
+      if (kind === 'corrupt-db') { writeFileSync(path.join(backup, 'database-snapshot-state'), 'present\n'); writeFileSync(path.join(backup, 'claude-mem.db'), 'not a sqlite database'); } else if (kind === 'missing-db') writeFileSync(path.join(backup, 'database-snapshot-state'), 'present\n'); else writeFileSync(path.join(backup, 'database-snapshot-state'), 'absent\n');
+      writeFileSync(path.join(fixture, 'release-window-v1.json'), JSON.stringify({ schemaVersion: 1, id: 'window', generation: 9, phase: 'snapshot_ready', startedAt: new Date().toISOString(), updatedAt: new Date().toISOString(), hookDrainAcknowledged: true, recoveryBounds: { startedAt: new Date().toISOString() } }));
+      writeFileSync(path.join(fixture, 'release-transaction-v1.json'), JSON.stringify({ schemaVersion: 1, id: 'receipt', generation: 9, phase: 'snapshot_ready', backupDir: backup, oldWorkerPath: worker, oldVersion: '13.14.0', quiescedWorkerPid: 999999, targets: [target] }));
+      const run = spawnSync('bash', [scriptPath, 'reconcile'], { cwd: root, encoding: 'utf8', env: { ...process.env, CLAUDE_MEM_UPGRADE_HOME: home, CLAUDE_MEM_DATA_DIR: fixture, CLAUDE_MEM_HEALTH_URL: 'http://127.0.0.1:1/api/health', CLAUDE_MEM_UPGRADE_SKIP_CHECKS: '1' } });
+      expect(run.status).not.toBe(0); expect(JSON.parse(readFileSync(path.join(fixture, 'release-window-v1.json'), 'utf8')).phase).toBe('snapshot_ready'); expect(readFileSync(path.join(target, 'replacement-asset'), 'utf8')).toContain('must remain');
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects every interior receipt-backup symlink before reconciliation can restore anything', () => {
+    for (const control of ['presence', 'database-snapshot-state', 'targets', 'metadata'] as const) {
+      const fixture = path.join('/tmp', `claude-mem-reconcile-backup-link-${control}-${process.pid}-${Date.now()}`);
+      const backup = path.join(fixture, 'backups', 'receipt');
+      const home = path.join(fixture, 'home');
+      const target = path.join(home, '.claude/plugins/cache/thedotmack/claude-mem/13.14.1');
+      const presence = path.join(backup, 'presence');
+      mkdirSync(path.join(backup, 'targets'), { recursive: true });
+      mkdirSync(path.join(backup, 'metadata'), { recursive: true });
+      mkdirSync(presence);
+      const markAbsent = (item: string) => writeFileSync(path.join(presence, require('crypto').createHash('sha256').update(item).digest('hex')), 'absent');
+      for (const item of [target, path.join(home, '.claude/plugins/installed_plugins.json'), path.join(home, '.claude/plugins/known_marketplaces.json'), path.join(fixture, 'settings.json'), path.join(fixture, 'build-attestation-v1.json'), path.join(fixture, 'chroma')]) markAbsent(item);
+      writeFileSync(path.join(backup, 'database-snapshot-state'), 'absent\n');
+      mkdirSync(target, { recursive: true });
+      writeFileSync(path.join(target, 'replacement-asset'), 'must remain behind the fence\n');
+      const oldWorker = path.join(home, '.claude/plugins/cache/thedotmack/claude-mem/13.14.0/scripts/worker-service.cjs');
+      mkdirSync(path.dirname(oldWorker), { recursive: true });
+      writeFileSync(oldWorker, '// fake managed worker\n');
+      const external = path.join(fixture, `external-${control}`);
+      if (control === 'database-snapshot-state') {
+        writeFileSync(external, 'absent\n');
+        rmSync(path.join(backup, control));
+      } else {
+        mkdirSync(external);
+        if (control === 'presence') for (const entry of require('fs').readdirSync(presence)) writeFileSync(path.join(external, entry), readFileSync(path.join(presence, entry)));
+        rmSync(path.join(backup, control), { recursive: true, force: true });
+      }
+      symlinkSync(external, path.join(backup, control));
+      const window = { schemaVersion: 1, id: 'window', generation: 9, phase: 'snapshot_ready', startedAt: new Date().toISOString(), updatedAt: new Date().toISOString(), hookDrainAcknowledged: true, recoveryBounds: { startedAt: new Date().toISOString() } };
+      writeFileSync(path.join(fixture, 'release-window-v1.json'), JSON.stringify(window));
+      writeFileSync(path.join(fixture, 'release-transaction-v1.json'), JSON.stringify({ schemaVersion: 1, id: 'receipt', generation: 9, phase: 'snapshot_ready', backupDir: backup, oldWorkerPath: oldWorker, oldVersion: '13.14.0', quiescedWorkerPid: 999999, targets: [target] }));
+      const run = spawnSync('bash', [scriptPath, 'reconcile'], { cwd: root, encoding: 'utf8', env: { ...process.env, CLAUDE_MEM_UPGRADE_HOME: home, CLAUDE_MEM_DATA_DIR: fixture, CLAUDE_MEM_HEALTH_URL: 'http://127.0.0.1:1/api/health', CLAUDE_MEM_UPGRADE_SKIP_CHECKS: '1' } });
+      expect(run.status).not.toBe(0);
+      expect(run.stderr).toContain('reconciliation backup contains a symlink');
+      expect(JSON.parse(readFileSync(path.join(fixture, 'release-window-v1.json'), 'utf8')).phase).toBe('snapshot_ready');
+      expect(readFileSync(path.join(target, 'replacement-asset'), 'utf8')).toContain('must remain');
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects dangerous destructive roots before it can inspect or mutate a target filesystem', () => {
+    const run = spawnSync('bash', [scriptPath, 'dry-run'], {
+      cwd: root, encoding: 'utf8',
+      env: { ...process.env, CLAUDE_MEM_UPGRADE_HOME: '/', CLAUDE_MEM_DATA_DIR: '/tmp/claude-mem-upgrade-test-data', CLAUDE_MEM_UPGRADE_SKIP_CHECKS: '1' },
+    });
+    expect(run.status).toBe(2);
+    expect(run.stderr).toContain('unsafe home root: /');
+  });
+
+  it('fresh-shell reconciliation resumes worker_quiesced before the ordinary manifest gate', () => {
+    expectFreshShellReconciliation('worker_quiesced');
+  });
+
+  it('fresh-shell reconciliation rolls back snapshot_ready before the ordinary manifest gate', () => {
+    expectFreshShellReconciliation('snapshot_ready');
+  });
+
+  it('fresh-shell reconciliation rolls back artifact_installed before the ordinary manifest gate', () => {
+    expectFreshShellReconciliation('artifact_installed');
+  });
+
+  it('fresh-shell reconciliation rolls back worker_attested before the ordinary manifest gate', () => {
+    expectFreshShellReconciliation('worker_attested');
+  });
+
+  it('fresh-shell reconciliation rolls back hooks_attached before the ordinary manifest gate', () => {
+    expectFreshShellReconciliation('hooks_attached');
+  });
+
+  it('fails closed on an untrusted writer lease before fresh reconciliation restores or starts anything', () => {
+    const fixture = path.join('/tmp', `claude-mem-reconcile-writer-lease-${process.pid}-${Date.now()}`);
+    const backup = path.join(fixture, 'backups', 'receipt');
+    const home = path.join(fixture, 'home');
+    const target = path.join(home, '.claude/plugins/cache/thedotmack/claude-mem/13.14.1');
+    const presence = path.join(backup, 'presence');
+    const markAbsent = (item: string) => writeFileSync(path.join(presence, require('crypto').createHash('sha256').update(item).digest('hex')), 'absent');
+    mkdirSync(path.join(backup, 'targets'), { recursive: true });
+    mkdirSync(path.join(backup, 'metadata'), { recursive: true });
+    mkdirSync(presence);
+    writeFileSync(path.join(backup, 'database-snapshot-state'), 'absent\n');
+    for (const item of [target, path.join(home, '.claude/plugins/installed_plugins.json'), path.join(home, '.claude/plugins/known_marketplaces.json'), path.join(fixture, 'settings.json'), path.join(fixture, 'build-attestation-v1.json'), path.join(fixture, 'chroma')]) markAbsent(item);
+    mkdirSync(target, { recursive: true });
+    writeFileSync(path.join(target, 'replacement-asset'), 'must remain behind the fence\n');
+    mkdirSync(path.join(fixture, 'chroma'), { recursive: true });
+    writeFileSync(path.join(fixture, 'chroma', '.claude-mem-chroma-writer.lock'), '{"owner":"unknown-or-stale"}\n');
+    const window = { schemaVersion: 1, id: 'window', generation: 9, phase: 'snapshot_ready', startedAt: new Date().toISOString(), updatedAt: new Date().toISOString(), hookDrainAcknowledged: true, recoveryBounds: { startedAt: new Date().toISOString() } };
+    writeFileSync(path.join(fixture, 'release-window-v1.json'), JSON.stringify(window));
+    writeFileSync(path.join(fixture, 'release-transaction-v1.json'), JSON.stringify({ schemaVersion: 1, id: 'receipt', generation: 9, phase: 'snapshot_ready', backupDir: backup, oldWorkerPath: path.join(home, '.claude/plugins/cache/thedotmack/claude-mem/13.14.0/scripts/worker-service.cjs'), oldVersion: '13.14.0', quiescedWorkerPid: 999999, targets: [target] }));
+    const run = spawnSync('bash', [scriptPath, 'reconcile'], { cwd: root, encoding: 'utf8', env: { ...process.env, CLAUDE_MEM_UPGRADE_HOME: home, CLAUDE_MEM_DATA_DIR: fixture, CLAUDE_MEM_HEALTH_URL: 'http://127.0.0.1:1/api/health', CLAUDE_MEM_UPGRADE_SKIP_CHECKS: '1' } });
+    expect(run.status).not.toBe(0);
+    expect(run.stderr).toContain('writer lease is present or untrusted');
+    expect(JSON.parse(readFileSync(path.join(fixture, 'release-window-v1.json'), 'utf8')).phase).toBe('snapshot_ready');
+    expect(readFileSync(path.join(target, 'replacement-asset'), 'utf8')).toContain('must remain');
+    rmSync(fixture, { recursive: true, force: true });
+  });
+
+  it('fails closed on a missing receipt and leaves an active maintenance fence intact', () => {
+    const fixture = path.join('/tmp', `claude-mem-reconcile-missing-${process.pid}-${Date.now()}`);
+    mkdirSync(fixture, { recursive: true });
+    const window = { schemaVersion: 1, id: 'window', generation: 9, phase: 'worker_quiesced', startedAt: new Date().toISOString(), updatedAt: new Date().toISOString(), hookDrainAcknowledged: true, recoveryBounds: { startedAt: new Date().toISOString() } };
+    writeFileSync(path.join(fixture, 'release-window-v1.json'), JSON.stringify(window));
+    const run = spawnSync('bash', [scriptPath, 'reconcile'], { cwd: root, encoding: 'utf8', env: { ...process.env, CLAUDE_MEM_UPGRADE_HOME: `${fixture}/home`, CLAUDE_MEM_DATA_DIR: fixture, CLAUDE_MEM_HEALTH_URL: 'http://127.0.0.1:1/api/health', CLAUDE_MEM_UPGRADE_SKIP_CHECKS: '1' } });
+    expect(run.status).not.toBe(0);
+    expect(JSON.parse(readFileSync(path.join(fixture, 'release-window-v1.json'), 'utf8')).phase).toBe('worker_quiesced');
+    rmSync(fixture, { recursive: true, force: true });
+  });
+
+  it('fails closed on an invalid receipt and leaves its active maintenance fence intact', () => {
+    const fixture = path.join('/tmp', `claude-mem-reconcile-invalid-${process.pid}-${Date.now()}`);
+    mkdirSync(fixture, { recursive: true });
+    const window = { schemaVersion: 1, id: 'window', generation: 9, phase: 'worker_quiesced', startedAt: new Date().toISOString(), updatedAt: new Date().toISOString(), hookDrainAcknowledged: true, recoveryBounds: { startedAt: new Date().toISOString() } };
+    writeFileSync(path.join(fixture, 'release-window-v1.json'), JSON.stringify(window));
+    writeFileSync(path.join(fixture, 'release-transaction-v1.json'), '{not json}\n');
+    const run = spawnSync('bash', [scriptPath, 'reconcile'], { cwd: root, encoding: 'utf8', env: { ...process.env, CLAUDE_MEM_UPGRADE_HOME: `${fixture}/home`, CLAUDE_MEM_DATA_DIR: fixture, CLAUDE_MEM_HEALTH_URL: 'http://127.0.0.1:1/api/health', CLAUDE_MEM_UPGRADE_SKIP_CHECKS: '1' } });
+    expect(run.status).not.toBe(0);
+    expect(JSON.parse(readFileSync(path.join(fixture, 'release-window-v1.json'), 'utf8')).phase).toBe('worker_quiesced');
+    rmSync(fixture, { recursive: true, force: true });
+  });
+
+  it('pins all tracked behavior/security files and an approved worker bundle', () => {
+    const manifest = JSON.parse(readFileSync(path.join(root, 'maintained-patches/nvidia-recovery-v13.14.0.json'), 'utf8'));
+    expect(manifest.expectedFileCount).toBe(Object.keys(manifest.files).length);
+    expect(manifest.expectedFileCount).toBe(14);
+    expect(manifest.approvedBundleSha256).toMatch(/^[a-f0-9]{64}$/);
+  });
+});

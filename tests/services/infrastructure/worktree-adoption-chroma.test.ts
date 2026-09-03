@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import * as realChromaMcpManager from '../../../src/services/sync/ChromaMcpManager.js';
 
 const chromaCalls: Array<{ name: string; args: Record<string, unknown> }> = [];
+let failNextChromaUpdate = false;
 const realChromaMcpManagerSnapshot = { ...realChromaMcpManager };
 
 mock.module('../../../src/services/sync/ChromaMcpManager.js', () => ({
@@ -13,6 +14,10 @@ mock.module('../../../src/services/sync/ChromaMcpManager.js', () => ({
     getInstance: () => ({
       callTool: async (name: string, args: Record<string, unknown>) => {
         chromaCalls.push({ name, args });
+        if (name === 'chroma_update_documents' && failNextChromaUpdate) {
+          failNextChromaUpdate = false;
+          throw new Error('simulated Chroma outage');
+        }
         if (name === 'chroma_create_collection') return {};
         if (name === 'chroma_get_documents') {
           return {
@@ -34,6 +39,7 @@ let mainRepoForCleanup: string | undefined;
 
 afterEach(() => {
   chromaCalls.length = 0;
+  failNextChromaUpdate = false;
   if (mainRepoForCleanup && existsSync(mainRepoForCleanup)) {
     try { git(mainRepoForCleanup, 'worktree', 'remove', '--force', path.join(tempRoot!, 'summary-worktree')); } catch {}
   }
@@ -109,5 +115,49 @@ describe('worktree adoption Chroma hydration', () => {
     expect(mergedProject).toBe('parent-repo');
     expect(chromaCalls.find(call => call.name === 'chroma_update_documents')?.args.ids)
       .toEqual(['summary_1_request']);
+  });
+
+  it('retries a durable Chroma patch when a later run has no adoption targets', async () => {
+    tempRoot = mkdtempSync(path.join(tmpdir(), 'claude-mem-adoption-retry-'));
+    const mainRepo = path.join(tempRoot, 'parent-repo');
+    mainRepoForCleanup = mainRepo;
+    const worktree = path.join(tempRoot, 'summary-worktree');
+    const dataDirectory = path.join(tempRoot, 'data');
+    mkdirSync(mainRepo, { recursive: true });
+    mkdirSync(dataDirectory);
+
+    git(mainRepo, 'init', '-b', 'main');
+    git(mainRepo, 'config', 'user.email', 'test@example.com');
+    git(mainRepo, 'config', 'user.name', 'Test');
+    writeFileSync(path.join(mainRepo, 'README.md'), 'base\n');
+    git(mainRepo, 'add', 'README.md');
+    git(mainRepo, 'commit', '-m', 'base');
+    git(mainRepo, 'worktree', 'add', '-b', 'feature', worktree);
+
+    const dbPath = path.join(dataDirectory, 'claude-mem.db');
+    const store = new SessionStore(dbPath);
+    const sdkSessionId = store.createSDKSession('content-retry', 'parent-repo/summary-worktree', 'prompt');
+    store.ensureMemorySessionIdRegistered(sdkSessionId, 'retry-session');
+    store.importSessionSummary({
+      memory_session_id: 'retry-session', project: 'parent-repo/summary-worktree', request: 'retry summary',
+      investigated: null, learned: null, completed: null, next_steps: null,
+      files_read: null, files_edited: null, notes: null, prompt_number: 1,
+      discovery_tokens: 0, created_at: new Date(1_700_000_000_000).toISOString(), created_at_epoch: 1_700_000_000_000,
+    });
+    store.close();
+
+    failNextChromaUpdate = true;
+    const failed = await adoptMergedWorktrees({ repoPath: mainRepo, dataDirectory, onlyBranch: 'feature' });
+    expect(failed.chromaPending).toBe(1);
+    expect(failed.chromaFailed).toBe(1);
+
+    const retried = await adoptMergedWorktrees({ repoPath: mainRepo, dataDirectory, onlyBranch: 'no-such-branch' });
+    expect(retried.mergedBranches).toEqual([]);
+    expect(retried.chromaUpdates).toBe(1);
+    expect(retried.chromaPending).toBe(0);
+    const verify = new SessionStore(dbPath);
+    expect(verify.db.prepare("SELECT status, attempts FROM worktree_adoption_chroma_outbox").get())
+      .toEqual({ status: 'applied', attempts: 2 });
+    verify.close();
   });
 });

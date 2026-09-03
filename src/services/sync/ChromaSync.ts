@@ -490,7 +490,7 @@ export class ChromaSync {
     promptNumber: number,
     createdAtEpoch: number,
     platformSource?: string
-  ): Promise<void> {
+  ): Promise<{ expected: number; written: number; complete: boolean }> {
     const stored: StoredSummary = {
       id: summaryId,
       memory_session_id: memorySessionId,
@@ -527,6 +527,7 @@ export class ChromaSync {
         written
       });
     }
+    return { expected: documents.length, written, complete: written === documents.length };
   }
 
   private formatUserPromptDoc(prompt: StoredUserPrompt): ChromaDocument {
@@ -1142,13 +1143,14 @@ export class ChromaSync {
   async updateMergedIntoProject(
     targets: MergedIntoProjectTarget[],
     mergedIntoProject: string
-  ): Promise<void> {
-    if (targets.length === 0) return;
+  ): Promise<number> {
+    if (targets.length === 0) return 0;
 
     await this.ensureCollectionExists();
     const chromaMcp = ChromaMcpManager.getInstance();
 
     let totalPatched = 0;
+    const coveredTargets = new Set<string>();
 
     for (const docType of ['observation', 'session_summary'] as const) {
       const sqliteIds = targets
@@ -1189,6 +1191,12 @@ export class ChromaSync {
           ids: docIds,
           metadatas
         });
+        for (const metadata of existing?.metadatas ?? []) {
+          const sqliteId = metadata?.sqlite_id;
+          if (typeof sqliteId === 'number' && idBatch.includes(sqliteId)) {
+            coveredTargets.add(`${docType}:${sqliteId}`);
+          }
+        }
         totalPatched += docIds.length;
       }
     }
@@ -1199,5 +1207,8 @@ export class ChromaSync {
       sqliteIdCount: targets.length,
       chromaDocsPatched: totalPatched
     });
+    // Return entity coverage (not document count): one observation can own
+    // several Chroma documents, while every queued SQLite entity needs proof.
+    return coveredTargets.size;
   }
 }

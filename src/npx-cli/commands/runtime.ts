@@ -136,19 +136,37 @@ export function runServerApiKeyCommand(extraArgs: string[] = []): void {
   spawnBunWorkerCommand('server', ['api-key', ...extraArgs]);
 }
 
-export function runAdoptCommand(extraArgs: string[] = []): void {
+export async function runAdoptCommand(extraArgs: string[] = []): Promise<void> {
   ensureInstalledOrExit();
-  const bunPath = resolveBunOrExit();
-  const workerScript = workerServiceScriptPath();
-
-  if (!existsSync(workerScript)) {
-    console.error(styleText('red', `Worker script not found at: ${workerScript}`));
-    console.error('The installation may be corrupted. Try: npx claude-mem install');
-    process.exit(1);
+  const token = process.env.CLAUDE_MEM_ADOPTION_TOKEN;
+  if (!token) { console.error(styleText('red', 'CLAUDE_MEM_ADOPTION_TOKEN is required for local adoption.')); process.exit(1); }
+  const host = SettingsDefaultsManager.get('CLAUDE_MEM_WORKER_HOST');
+  const port = SettingsDefaultsManager.get('CLAUDE_MEM_WORKER_PORT');
+  if (!['127.0.0.1', 'localhost', '::1'].includes(host)) { console.error(styleText('red', 'Adoption requires a loopback root worker.')); process.exit(1); }
+  let parsed: { parentProject: string; sources: Array<{ project: string; branch: string }>; dryRun?: boolean };
+  try {
+    // The root worker owns filesystem validation and SQLite writes. The CLI
+    // only transports the strictly-declared logical source set.
+    const { parseAdoptCommand } = await import('../../services/worker-service.js');
+    const command = parseAdoptCommand(extraArgs);
+    if (command.mode !== 'explicit') throw new Error('CLI adoption requires --parent-project and declared --source-project/--branch pairs');
+    parsed = command;
+  } catch (error) { console.error(styleText('red', error instanceof Error ? error.message : String(error))); process.exit(1); }
+  let response: Response;
+  try {
+    response = await fetch(`http://${host === '::1' ? '[::1]' : host}:${port}/api/admin/worktree-adoption`, {
+      method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(parsed),
+    });
+  } catch { console.error(styleText('red', 'Root worker is not running or is unreachable.')); process.exit(1); }
+  const payload = await response.json().catch(() => ({})) as { status?: string; error?: string; result?: unknown };
+  const expectedStatus = parsed.dryRun ? 'dry_run' : 'complete';
+  if (!response.ok || payload.status !== expectedStatus) { console.error(styleText('red', payload.error ?? 'Adoption pending Chroma reconciliation.')); process.exit(2); }
+  if (parsed.dryRun) {
+    console.log('Worktree adoption dry run complete (no SQLite or Chroma writes were performed; Chroma proof was not attempted).');
+  } else {
+    console.log('Worktree adoption complete (SQLite and Chroma proof verified).');
   }
-
-  const userCwd = process.cwd();
-  spawnPlugin(bunPath, [workerScript, 'adopt', '--cwd', userCwd, ...extraArgs]);
 }
 
 export function runCleanupCommand(extraArgs: string[] = []): void {

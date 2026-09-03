@@ -29,6 +29,7 @@ import { telemetryBuffer } from './telemetry/buffer.js';
 import { collectInstallStats } from './telemetry/install-stats.js';
 import { runHistoricalBackfill } from './telemetry/backfill.js';
 import { runWorkerDependencyPreflight } from './worker/dependency-preflight.js';
+import { ReleaseWindowManager } from './release/ReleaseWindow.js';
 
 export { isPluginDisabledInClaudeSettings } from '../shared/plugin-state.js';
 import { isPluginDisabledInClaudeSettings } from '../shared/plugin-state.js';
@@ -56,7 +57,7 @@ import {
   httpShutdown
 } from './infrastructure/HealthMonitor.js';
 import { performGracefulShutdown } from './infrastructure/GracefulShutdown.js';
-import { adoptMergedWorktrees, adoptMergedWorktreesForAllKnownRepos, formatAdoptionErrors } from './infrastructure/WorktreeAdoption.js';
+import { adoptMergedWorktreesForAllKnownRepos, formatAdoptionErrors } from './infrastructure/WorktreeAdoption.js';
 
 import { Server } from './server/Server.js';
 import { BetterAuthRoutes } from '../server/auth/BetterAuthRoutes.js';
@@ -83,6 +84,7 @@ import { ClaudeProvider, classifyClaudeError } from './worker/ClaudeProvider.js'
 import type { WorkerRef } from './worker/agents/types.js';
 import { GeminiProvider, classifyGeminiError, isGeminiSelected, isGeminiAvailable } from './worker/GeminiProvider.js';
 import { OpenRouterProvider, classifyOpenRouterError, isOpenRouterSelected, isOpenRouterAvailable } from './worker/OpenRouterProvider.js';
+import { NvidiaProvider, isNvidiaSelected, isNvidiaAvailable } from './worker/NvidiaProvider.js';
 import { ClassifiedProviderError, isClassified, type ProviderErrorClass } from './worker/provider-errors.js';
 import { PaginationHelper } from './worker/PaginationHelper.js';
 import { SettingsManager } from './worker/SettingsManager.js';
@@ -91,6 +93,10 @@ import { FormattingService } from './worker/FormattingService.js';
 import { TimelineService } from './worker/TimelineService.js';
 import { SessionEventBroadcaster } from './worker/events/SessionEventBroadcaster.js';
 import { SessionCompletionHandler } from './worker/session/SessionCompletionHandler.js';
+import { RecoveryJobService } from './recovery/RecoveryJobService.js';
+import { RecoveryConsumer } from './recovery/RecoveryConsumer.js';
+import { HistoricalRecoveryScanner } from './recovery/HistoricalRecoveryScanner.js';
+import { RecoveryScannerScheduler } from './recovery/RecoveryScannerScheduler.js';
 import { setIngestContext, attachIngestGeneratorStarter } from './worker/http/shared.js';
 import { DEFAULT_CONFIG_PATH, DEFAULT_STATE_PATH, expandHomePath, filterNativeHookBackedCodexWatches, loadTranscriptWatchConfig } from './transcripts/config.js';
 import { TranscriptWatcher } from './transcripts/watcher.js';
@@ -107,6 +113,8 @@ import { MemoryRoutes } from './worker/http/routes/MemoryRoutes.js';
 import { CorpusRoutes } from './worker/http/routes/CorpusRoutes.js';
 import { ChromaRoutes } from './worker/http/routes/ChromaRoutes.js';
 import { CloudSyncRoutes } from './worker/http/routes/CloudSyncRoutes.js';
+import { RecoveryRoutes } from './worker/http/routes/RecoveryRoutes.js';
+import { WorktreeAdoptionRoutes } from './worker/http/routes/WorktreeAdoptionRoutes.js';
 
 import { CorpusStore } from './worker/knowledge/CorpusStore.js';
 import { CorpusBuilder } from './worker/knowledge/CorpusBuilder.js';
@@ -213,10 +221,14 @@ export class WorkerService implements WorkerRef {
   private sdkAgent: ClaudeProvider;
   private geminiAgent: GeminiProvider;
   private openRouterAgent: OpenRouterProvider;
+  private nvidiaAgent: NvidiaProvider;
   private paginationHelper: PaginationHelper;
   private settingsManager: SettingsManager;
   private sessionEventBroadcaster: SessionEventBroadcaster;
   private completionHandler: SessionCompletionHandler;
+  private recoveryJobs: RecoveryJobService | null = null;
+  private recoveryConsumer: RecoveryConsumer | null = null;
+  private recoveryScannerScheduler: RecoveryScannerScheduler | null = null;
   private corpusStore: CorpusStore;
 
   private searchRoutes: SearchRoutes | null = null;
@@ -245,6 +257,7 @@ export class WorkerService implements WorkerRef {
     this.sdkAgent = new ClaudeProvider(this.dbManager, this.sessionManager);
     this.geminiAgent = new GeminiProvider(this.dbManager, this.sessionManager);
     this.openRouterAgent = new OpenRouterProvider(this.dbManager, this.sessionManager);
+    this.nvidiaAgent = new NvidiaProvider(this.dbManager, this.sessionManager);
 
     this.paginationHelper = new PaginationHelper(this.dbManager);
     this.settingsManager = new SettingsManager(this.dbManager);
@@ -278,11 +291,12 @@ export class WorkerService implements WorkerRef {
       workerPath: __filename,
       getAiStatus: () => {
         let provider = 'claude';
-        if (isOpenRouterSelected() && isOpenRouterAvailable()) provider = 'openrouter';
+        if (isNvidiaSelected() && isNvidiaAvailable()) provider = 'nvidia';
+        else if (isOpenRouterSelected() && isOpenRouterAvailable()) provider = 'openrouter';
         else if (isGeminiSelected() && isGeminiAvailable()) provider = 'gemini';
         return {
           provider,
-          authMethod: getAuthMethodDescription(),
+          authMethod: providerAuthMethodDescription(provider),
           lastInteraction: this.lastAiInteraction
             ? {
                 timestamp: this.lastAiInteraction.timestamp,
@@ -352,7 +366,7 @@ export class WorkerService implements WorkerRef {
     });
 
     this.server.registerRoutes(new ViewerRoutes(this.sseBroadcaster, this.dbManager, this.sessionManager));
-    const sessionRoutes = new SessionRoutes(this.sessionManager, this.dbManager, this.sdkAgent, this.geminiAgent, this.openRouterAgent, this.sessionEventBroadcaster, this, this.completionHandler);
+    const sessionRoutes = new SessionRoutes(this.sessionManager, this.dbManager, this.sdkAgent, this.geminiAgent, this.openRouterAgent, this.nvidiaAgent, this.sessionEventBroadcaster, this, this.completionHandler);
     this.server.registerRoutes(sessionRoutes);
     attachIngestGeneratorStarter((sessionDbId, source) =>
       sessionRoutes.ensureGeneratorRunning(sessionDbId, source),
@@ -361,6 +375,8 @@ export class WorkerService implements WorkerRef {
     this.server.registerRoutes(new SettingsRoutes(this.settingsManager));
     this.server.registerRoutes(new LogsRoutes());
     this.server.registerRoutes(new MemoryRoutes(this.dbManager, 'claude-mem'));
+    this.server.registerRoutes(new RecoveryRoutes(this.dbManager, () => this.recoveryConsumer));
+    this.server.registerRoutes(new WorktreeAdoptionRoutes());
     this.server.registerRoutes(new ServerV1Routes({
       getDatabase: () => this.dbManager.getConnection(),
     }));
@@ -486,6 +502,80 @@ export class WorkerService implements WorkerRef {
 
       logger.info('WORKER', 'Initializing database manager...');
       await this.dbManager.initialize();
+
+      // A successful installer deliberately leaves hooks fenced at
+      // window_closed.  The newly started root worker is the only process
+      // that can prove canonical recovery ran for that exact durable interval
+      // and release the fence.  Do this after SQLite is ready, before normal
+      // hook-triggered work can be accepted.
+      const releaseWindow = new ReleaseWindowManager();
+      const pendingRelease = releaseWindow.current();
+      if (pendingRelease?.phase === 'window_closed') {
+        if (!isNvidiaSelected() || !isNvidiaAvailable()) {
+          throw new Error('Canonical release recovery requires the configured NVIDIA recovery worker; maintenance fence remains active');
+        }
+        const endedAt = pendingRelease.recoveryBounds.endedAt;
+        if (!endedAt) throw new Error('Closed release window is missing durable recovery bounds');
+        this.recoveryConsumer = new RecoveryConsumer(this.dbManager, this.nvidiaAgent);
+        let plan = releaseWindow.canonicalRecoveryPlan(pendingRelease.generation);
+        let report: Awaited<ReturnType<HistoricalRecoveryScanner['scan']>> | null = null;
+        if (!plan) {
+          // Do not use the scheduler's deliberately bounded normal-history
+          // batch here.  This is the release proof and must capture every
+          // canonical turn in the immutable release interval before any job
+          // can release the hook fence.
+          report = await new HistoricalRecoveryScanner(this.dbManager.getSessionStore()).scan(false, Number.POSITIVE_INFINITY, {
+            startedAt: pendingRelease.recoveryBounds.startedAt,
+            endedAt,
+          });
+          if (report.truncated) throw new Error('Canonical recovery scan exceeded its explicit finite discovery budget');
+          plan = releaseWindow.persistCanonicalRecoveryPlan(pendingRelease.generation, report.candidates);
+        }
+        // Process only a finite number of startup attempts.  A retry, dead
+        // letter, queue contention, or any unresolved planned candidate falls
+        // through to the final receipt check and intentionally keeps hooks
+        // fenced instead of pretending that a scan alone recovered the window.
+        const jobsToProcess = plan.candidates.filter(candidate => candidate.disposition === 'job').length;
+        for (let attempt = 0; attempt < jobsToProcess; attempt += 1) await this.recoveryConsumer.tick(true);
+        releaseWindow.recordCanonicalRecoveryCompletion(pendingRelease.generation, this.dbManager.getSessionStore());
+        logger.info('SYSTEM', 'Canonical release recovery completed', {
+          generation: pendingRelease.generation,
+          recoveryBounds: pendingRelease.recoveryBounds,
+          candidates: plan.candidates.length,
+          enqueued: report?.enqueued ?? 0,
+        });
+      }
+
+      this.recoveryJobs = new RecoveryJobService(this.dbManager.getSessionStore());
+      this.sessionManager.setOnMalformedOutputExhausted(async (event) => {
+        const session = this.dbManager.getSessionById(event.sessionDbId);
+        const job = this.recoveryJobs!.enqueue({
+          contentSessionId: session.content_session_id,
+          recoveryKind: 'session_summary',
+          project: session.project,
+          platformSource: session.platform_source,
+          transcriptLocator: session.transcript_locator,
+          reason: `malformed_${event.outputClass}`,
+          sanitizedError: `Provider returned invalid summary output after ${event.retryCount} repair attempts: ${event.preview.slice(0, 240)}`,
+        });
+        logger.warn('SESSION', 'Queued malformed summary for durable recovery', {
+          recoveryJobId: job.id,
+          sessionId: event.sessionDbId,
+          contentSessionId: session.content_session_id,
+          project: session.project,
+          platformSource: session.platform_source,
+        });
+      });
+      if (isNvidiaSelected() && isNvidiaAvailable()) {
+        this.recoveryConsumer ??= new RecoveryConsumer(this.dbManager, this.nvidiaAgent);
+        this.recoveryConsumer.start();
+        this.recoveryScannerScheduler = new RecoveryScannerScheduler(() =>
+          new HistoricalRecoveryScanner(this.dbManager.getSessionStore(), undefined, undefined, 5 * 60_000).scan(false, 100),
+        );
+        this.recoveryScannerScheduler.start();
+      } else {
+        logger.warn('SESSION', 'Recovery consumer is paused until native NVIDIA is selected and configured');
+      }
 
       runOneTimeV12_4_3Cleanup();
 
@@ -791,6 +881,10 @@ export class WorkerService implements WorkerRef {
       isShuttingDown: () => this.isShuttingDown,
       markShuttingDown: () => { this.isShuttingDown = true; },
       beforeGracefulShutdown: async () => {
+        await this.recoveryScannerScheduler?.stop();
+        this.recoveryScannerScheduler = null;
+        await this.recoveryConsumer?.stop();
+        this.recoveryConsumer = null;
         if (this.transcriptWatcher) {
           this.transcriptWatcher.stop();
           this.transcriptWatcher = null;
@@ -898,6 +992,72 @@ export function parseWorkerServiceCommand(argv: string[]): ParsedWorkerCommand {
     command: rawCommand,
     args: maybeSubCommand === undefined ? [] : [maybeSubCommand, ...rest],
   };
+}
+
+export type ParsedAdoptCommand =
+  | { mode: 'automatic'; dryRun: boolean; onlyBranch?: string; repoPath?: string }
+  | { mode: 'explicit'; dryRun: boolean; repoPath?: string; parentProject: string; sources: Array<{ project: string; branch: string }> };
+
+/** Parse the small, fail-closed adoption CLI surface without accepting aliases. */
+export function parseAdoptCommand(argv: string[]): ParsedAdoptCommand {
+  const reject = (message: string): never => { throw new Error(`${message}\nUsage: adopt [--dry-run] [--branch <branch>] [--cwd <path>] | adopt --parent-project <project> --source-project <project> --branch <branch> [--source-project <project> --branch <branch> ...] [--dry-run] [--cwd <path>]`); };
+  const explicit = argv.includes('--parent-project') || argv.includes('--source-project');
+  let dryRun = false;
+  let repoPath: string | undefined;
+  let onlyBranch: string | undefined;
+  let parentProject: string | undefined;
+  const sources: Array<{ project: string; branch: string }> = [];
+
+  const readValue = (flag: string, index: number): string => {
+    const value = argv[index + 1];
+    if (!value || value.startsWith('--')) reject(`Missing option value for ${flag}`);
+    return value;
+  };
+
+  for (let index = 0; index < argv.length; index++) {
+    const arg = argv[index];
+    switch (arg) {
+      case '--dry-run':
+        if (dryRun) reject('Duplicate option: --dry-run');
+        dryRun = true;
+        break;
+      case '--cwd':
+        if (repoPath !== undefined) reject('Duplicate option: --cwd');
+        repoPath = readValue(arg, index++);
+        break;
+      case '--parent-project':
+        if (parentProject !== undefined) reject('Duplicate option: --parent-project');
+        parentProject = readValue(arg, index++);
+        break;
+      case '--source-project': {
+        const project = readValue(arg, index++);
+        if (!explicit || argv[index + 1] !== '--branch') {
+          reject('Each --source-project must be immediately followed by --branch <branch>');
+        }
+        const branch = readValue('--branch', index + 1);
+        index += 2;
+        sources.push({ project, branch });
+        break;
+      }
+      case '--branch':
+        if (explicit) reject('Explicit adoption requires each --source-project/--branch pair to be adjacent');
+        if (onlyBranch !== undefined) reject('Automatic adoption accepts at most one --branch');
+        onlyBranch = readValue(arg, index++);
+        break;
+      default:
+        if (arg.startsWith('--')) reject(`Unknown option: ${arg}`);
+        reject(`Unexpected argument: ${arg}`);
+    }
+  }
+
+  if (!explicit) {
+    return { mode: 'automatic', dryRun, onlyBranch, repoPath };
+  }
+  const explicitParentProject = parentProject ?? reject('Explicit adoption requires one --parent-project and one exact --source-project/--branch pair per source');
+  if (sources.length === 0) {
+    reject('Explicit adoption requires one --parent-project and one exact --source-project/--branch pair per source');
+  }
+  return { mode: 'explicit', dryRun, repoPath, parentProject: explicitParentProject, sources };
 }
 
 function printServerCommandHelp(): never {
@@ -1327,13 +1487,31 @@ async function main() {
         process.exit(1);
       }
 
-      const workerStartResult = await ensureWorkerStarted(port);
-      if (workerStartResult === 'dead') {
-        logger.warn('SYSTEM', 'Worker failed to start before hook, handler will proceed gracefully');
+      // Acquire before the worker-start attempt as well as the handler.  An
+      // installer detaching hooks therefore fences both new work and a hook
+      // that would otherwise create a replacement writer during quiescence.
+      const release = new ReleaseWindowManager();
+      const releaseHookLease = release.tryAcquireHookLease();
+      if (!releaseHookLease) {
+        // Preserve the host hook protocol while detached, but intentionally do
+        // not invoke an adapter/handler or start a worker.
+        const { emitModelContext, exitGraceful } = await import('../shared/hook-io.js');
+        const { getPlatformAdapter } = await import('../cli/adapters/index.js');
+        emitModelContext(getPlatformAdapter(platform), { continue: true, suppressOutput: true, ...(event === 'context' ? { hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: '' } } : {}) });
+        exitGraceful();
+        return;
       }
+      try {
+        const workerStartResult = await ensureWorkerStarted(port);
+        if (workerStartResult === 'dead') {
+          logger.warn('SYSTEM', 'Worker failed to start before hook, handler will proceed gracefully');
+        }
 
-      const { hookCommand } = await import('../cli/hook-command.js');
-      await hookCommand(platform, event);
+        const { hookCommand } = await import('../cli/hook-command.js');
+        await hookCommand(platform, event);
+      } finally {
+        releaseHookLease();
+      }
       break;
     }
 
@@ -1366,40 +1544,8 @@ async function main() {
     }
 
     case 'adopt': {
-      const dryRun = process.argv.includes('--dry-run');
-      const branchIndex = process.argv.indexOf('--branch');
-      const branchValue = branchIndex !== -1 ? process.argv[branchIndex + 1] : undefined;
-      if (branchIndex !== -1 && (!branchValue || branchValue.startsWith('--'))) {
-        console.error('Usage: adopt [--dry-run] [--branch <branch>] [--cwd <path>]');
-        process.exit(1);
-      }
-      const onlyBranch = branchValue;
-      const cwdIndex = process.argv.indexOf('--cwd');
-      const cwdValue = cwdIndex !== -1 ? process.argv[cwdIndex + 1] : undefined;
-      if (cwdIndex !== -1 && (!cwdValue || cwdValue.startsWith('--'))) {
-        console.error('Usage: adopt [--dry-run] [--branch <branch>] [--cwd <path>]');
-        process.exit(1);
-      }
-      const repoPath = cwdValue ?? process.cwd();
-
-      const result = await adoptMergedWorktrees({ repoPath, dryRun, onlyBranch });
-
-      const tag = result.dryRun ? '(dry-run)' : '(applied)';
-      console.log(`\nWorktree adoption ${tag}`);
-      console.log(`  Parent project:       ${result.parentProject || '(unknown)'}`);
-      console.log(`  Repo:                 ${result.repoPath}`);
-      console.log(`  Worktrees scanned:    ${result.scannedWorktrees}`);
-      console.log(`  Merged branches:      ${result.mergedBranches.join(', ') || '(none)'}`);
-      console.log(`  Observations adopted: ${result.adoptedObservations}`);
-      console.log(`  Summaries adopted:    ${result.adoptedSummaries}`);
-      console.log(`  Chroma docs updated:  ${result.chromaUpdates}`);
-      if (result.chromaFailed > 0) {
-        console.log(`  Chroma sync failures: ${result.chromaFailed} (will retry on next run)`);
-      }
-      for (const err of result.errors) {
-        console.log(`  ! ${err.worktree}: ${err.error}`);
-      }
-      process.exit(0);
+      console.error('Direct worker-service adoption is disabled. Use `npx claude-mem adopt` so the loopback root worker validates the declared sources and owns SQLite writes.');
+      process.exit(1);
     }
 
     case 'cleanup': {
@@ -1572,4 +1718,10 @@ if (isMainModule) {
     logger.error('SYSTEM', 'Fatal error in main', {}, error instanceof Error ? error : undefined);
     process.exit(0);  
   });
+}
+export function providerAuthMethodDescription(provider: string): string {
+  if (provider === 'nvidia') return 'NVIDIA API key';
+  if (provider === 'openrouter') return 'OpenRouter API key';
+  if (provider === 'gemini') return 'Gemini API key';
+  return getAuthMethodDescription();
 }

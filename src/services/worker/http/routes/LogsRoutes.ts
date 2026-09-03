@@ -1,6 +1,6 @@
 
 import express, { Request, Response } from 'express';
-import { openSync, fstatSync, readSync, closeSync, existsSync, writeFileSync } from 'fs';
+import { openSync, fstatSync, readSync, closeSync, existsSync, writeFileSync, readdirSync, statSync } from 'fs';
 import { join } from 'path';
 import { logger } from '../../../../utils/logger.js';
 import { SettingsDefaultsManager } from '../../../../shared/SettingsDefaultsManager.js';
@@ -67,12 +67,26 @@ export function readLastLines(filePath: string, lineCount: number): { lines: str
   }
 }
 
+export function resolveActiveLogFile(logsDir: string, now = new Date()): string {
+  const todayPath = join(logsDir, `claude-mem-${now.toISOString().split('T')[0]}.log`);
+  const candidates = existsSync(logsDir)
+    ? readdirSync(logsDir)
+      .filter(name => /^claude-mem-\d{4}-\d{2}-\d{2}\.log$/.test(name))
+      .map(name => join(logsDir, name))
+    : [];
+
+  if (candidates.length === 0) return todayPath;
+
+  return candidates.reduce((latest, candidate) =>
+    statSync(candidate).mtimeMs > statSync(latest).mtimeMs ? candidate : latest
+  );
+}
+
 export class LogsRoutes extends BaseRouteHandler {
   private getLogFilePath(): string {
     const dataDir = SettingsDefaultsManager.get('CLAUDE_MEM_DATA_DIR');
     const logsDir = join(dataDir, 'logs');
-    const date = new Date().toISOString().split('T')[0];
-    return join(logsDir, `claude-mem-${date}.log`);
+    return resolveActiveLogFile(logsDir);
   }
 
   private getLogsDir(): string {
