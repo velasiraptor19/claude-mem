@@ -7,6 +7,7 @@
 - `docs/maintained/CUSTOMIZATIONS.md`
 - `docs/maintained/UPSTREAM_13.14_TO_13.24.md`
 - `docs/maintained/RETRIEVAL_BASELINE.md`
+- `docs/maintained/GLOBAL_CODEX_AGENTS.md`
 
 Mantıksal hafıza projesi `claude-mem`dir; sürüm worktree'leri ayrı hafıza
 projeleri değil, tarihsel kaynak varyantlarıdır. Hafıza araması bir indekstir,

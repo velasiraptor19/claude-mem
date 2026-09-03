@@ -3,8 +3,9 @@
   "upstreamCommit": "1df66c2c4f7dc40d02e9d3a1c5a6f6e4562f8d79",
   "approvedBundleSha256": "012cd5e26ef1244e764bda965261d443ed6936df668eab157c47d4c109c93d3d",
   "files": {
-    "AGENTS.md": "092cf9b734a9248fd4ce38404a17e3d80b1ffa57be62684dc503fd4e1bf192ae",
+    "AGENTS.md": "1d09b3cd4058092f5f4356d3636b6be1f78032d65ae8f44ab9896956a9f2c1d9",
     "docs/maintained/CUSTOMIZATIONS.md": "05d5c830cbfb7f763a26525cd518020beb37c684a655dffcf5165366e44d4f29",
+    "docs/maintained/GLOBAL_CODEX_AGENTS.md": "80668dfc2a570d2d79ba429d1ab023fad1718f3d9ff412149cdb02da1745852e",
     "docs/maintained/RETRIEVAL_BASELINE.md": "ae3f21372aadb1d5a4cd903ef3974a4cd7aee96f1b9b6035f3b3e91d1cc93c65",
     "docs/maintained/UPGRADE_HISTORY.md": "8259bdf6aac43b3cb8cf2201dd079a0820b4bae7bf3e4489873869b939da2231",
     "docs/maintained/UPGRADE_RUNBOOK.md": "dc4a3cc43a32e7e32f13417dc1790c95aa44c2074eb672b39c27ca1c468aa885",
@@ -13,7 +14,7 @@
     "scripts/dependency-tree-manifest.cjs": "e19eefcf1cd384039ab3127e0c918579fd4e92c12bb35c82534e253be33355c5",
     "scripts/maintained-diff-report.cjs": "8cf8a0e610bc406cf89ca6d2cae79d60dcc2625187a3035bef4403788d031f83",
     "scripts/maintained-upgrade.sh": "433ce7efc5470397792d0b768c761c7f60dadba612a163eac6b41ba7bdd75930",
-    "scripts/refresh-maintained-manifest.cjs": "b9294da846e8aaa7cf8c5e0da687de77d838b6e954b2004a407bd6b2e767c4d9",
+    "scripts/refresh-maintained-manifest.cjs": "61c2f07285183867c54a7d6ae696dc1ff0d52eb85305b00d52898f9141a5adaa",
     "scripts/release-transaction.cjs": "a7200394d3828a40cc10b08ad140aa90500d71e9824fea4a4a8d2c904e112bf4",
     "scripts/release-window.cjs": "6a7bc4a170f445eacb553c8113ae5a1d8add423318cef0be8035ebe2523429ad",
     "scripts/repair-observation-field-labels.ts": "30e51e287d584bdc48eb2b46d8f4c1be6e8c208e36d529cad5d2104387799f68",
@@ -116,7 +117,7 @@
     "tests/worker/session-manager-null-prompt.test.ts": "b626d1c9da8056411fafe0d06be2c94a1d6b645891651542e9721112d871cf28",
     "tests/worker/sync/mutation-sites.test.ts": "be3d868b8d90dd5eb5e1f53ed8fa87a6ea28742f422e426bdbb2bd295a18c33f"
   },
-  "expectedFileCount": 112,
+  "expectedFileCount": 113,
   "deployedPluginFiles": {
     ".claude-plugin/plugin.json": "ef0631d2a0a97abd63a56aa5463bb595e3e4d91590a71d60d0ad9995ad027b6c",
     ".codex-plugin/plugin.json": "3fbd25116f0840a69420ca94cad7ef52cf63ce4a32adafe04ff213a25fa2f5de",
