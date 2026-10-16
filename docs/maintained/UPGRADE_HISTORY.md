@@ -198,3 +198,28 @@ worker yeniden başlatıldı ve health/path doğrulandı; pencere `failed` ile k
 normal dosya, eski zaman damgası, aynı Chroma yolu, ölü PID ve değişmeyen inode/
 içerik kanıtıyla temizleyen dar installer adımı eklendi. Canlı veya kimliği
 belirsiz lease korunur. Bu olay yeni sürümün kurulduğu anlamına gelmez.
+
+### Başarılı 13.40.0 terfisi — generation 20
+
+Generation 19 olayı için dar kilit düzeltmesi ve regresyon testinden sonra
+tam-manifest SHA-256 `9cbee9f71b6c66b8d617c9c5f41e0a18194aab176bb026e027c513299ef9f047`
+ile kontrollü installer yeniden çalıştı. 9.496 test geçti, 46 isteğe bağlı
+test atlandı, hata yoktu. Ölü PID 15132'ye ait eski kilit, drained fence
+altında kimlik/yaş/inode kanıtıyla temizlendi. Snapshot alındı, yeni worker
+health ve readiness'te doğrulandı; release window `recovery_reconciled`,
+transaction `complete`, canonical recovery plan/receipt generation 20 oldu.
+
+Üç kurulu worker bundle'ı aynı `1d7b9d87c278f5c31659be4d66621b51578a7141db9a473f32541e571a266d49`
+özetiyle eşleşir. Worker 13.40.0 ve MCP ready'dir; Chroma prewarm `ok`, ölü
+süreç PID'si yoktur. Store UUID öncekiyle aynıdır; SQLite integrity `ok`, FK
+ihlali sıfırdır. Sabit 20 retrieval örneğinin 20'si ilk beşte bulundu
+(MRR 0,6692). Ayarlar yedek ve canlı dosyada byte-identical kaldı; NVIDIA
+sağlayıcısı değiştirilmedi. Doctor Claude ve Codex'i aynı store ile uyumlu
+gösterir. Build attestation deployed commit `52a17de78544ad2fcf5f4319619850728cea5315`
+ve yukarıdaki onaylı manifesti kaydeder.
+
+Bu başarı kaydı terfi sonrası ayrı belge commit'idir. Belge değişiminden sonra
+yenilenen kaynak manifesti canlı build attestation'ın yerine geçmez. Açık
+Claude/Codex istemci oturumları yeni hook girişlerini almak için yeniden
+açılmalıdır. Gerçek sağlayıcı kalitesi ve üç gerçek çapraz-istemci capture
+çevrimi bu terfinin kanıtı değildir.
