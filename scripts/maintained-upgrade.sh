@@ -666,6 +666,9 @@ stop_worker() {
   running_token="$(awk '{print $22}' "/proc/$running_pid/stat" 2>/dev/null)" || { echo "running worker identity unavailable; refusing state restore" >&2; return 1; }
   running_pgid="$(ps -o pgid= -p "$running_pid" | tr -d ' ')" || return 1
   [[ "$running_pgid" == "$running_pid" ]] || { echo "managed worker does not own a dedicated process group" >&2; return 1; }
+  # A previous, dead Chroma owner can leave a lock that predates this release.
+  # Reap it only under the drained hook fence, with exact owner and inode proof.
+  node "$repo_dir/scripts/reap-stale-writer-lease.cjs" "$data_dir" "$running_pid" || return 1
   curl -fsS --max-time 2 -X POST "$shutdown_url" >/dev/null 2>&1 || npx claude-mem stop >/dev/null 2>&1 || true
   # The HTTP listener closes before final teardown (including chroma-mcp and
   # its writer lock). Replacing the plugin as soon as the port is free races

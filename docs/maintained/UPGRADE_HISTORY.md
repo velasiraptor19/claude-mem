@@ -182,3 +182,19 @@ hazırlığı yeni sağlayıcı, cloud veya isteğe bağlı istemci etkinleştir
   worker'a capture gönderebilir; ancak worker kaybı sonrası eski başlangıç yolu
   eski worker'ı başlatabilir. Terfi sonrası iki istemci de yeniden açılmalıdır;
   release fence bu istemci yenilemesinin yerine geçmez.
+
+### 13.40 terfi denemesi — generation 19 güvenli duruş
+
+Tam manifest ve iki ardışık 9.494/9.494 başarılı testten sonra installer
+hook'ları ayırıp drain etti. Worker kapandı; fakat Chroma writer lease dosyası
+19 Eylül'den kalmış, PID 15132'ye aitti. Bu PID'nin süreç girdisi yoktu; lease
+mevcut worker PID'siyle eşleşmediği için installer doğru biçimde durdu. Snapshot
+ve yeni artifact kurulumu başlamamıştı. Eski 13.24.0 bundle hash'i üç hedefte
+aynı doğrulandı, veritabanı dosyalarını tutan süreç yoktu. Generation 19
+`rolling_back` durumuna alındı; generation'a bağlı tek kullanımlık yetkiyle eski
+worker yeniden başlatıldı ve health/path doğrulandı; pencere `failed` ile kapandı.
+
+Önceden kalmış writer lease'ini yalnız `hooks_drained` penceresinde, root-owned
+normal dosya, eski zaman damgası, aynı Chroma yolu, ölü PID ve değişmeyen inode/
+içerik kanıtıyla temizleyen dar installer adımı eklendi. Canlı veya kimliği
+belirsiz lease korunur. Bu olay yeni sürümün kurulduğu anlamına gelmez.

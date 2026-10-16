@@ -25,7 +25,7 @@
   },
   "approvedBundleSha256": "1d7b9d87c278f5c31659be4d66621b51578a7141db9a473f32541e571a266d49",
   "files": {
-    "scripts/maintained-upgrade.sh": "4e93f7a6641b018326360f63b92f8c0deb9cd8d4be16bdc5278c70745b7c4397",
+    "scripts/maintained-upgrade.sh": "4fd69b866feb8babd53d27fcc3e1f5c5d822a41387b36452d9581a8f9fd57083",
     "scripts/release-transaction.cjs": "a7200394d3828a40cc10b08ad140aa90500d71e9824fea4a4a8d2c904e112bf4",
     "scripts/release-window.cjs": "6a7bc4a170f445eacb553c8113ae5a1d8add423318cef0be8035ebe2523429ad",
     "scripts/verify-approved-manifest.cjs": "ca8aa8b5f9f78ce0f3032e006c81920780ef6231eac25170c01454a9aa028e93",
