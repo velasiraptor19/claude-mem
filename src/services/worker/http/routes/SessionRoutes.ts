@@ -14,6 +14,7 @@ import { OpenRouterProvider } from '../../OpenRouterProvider.js';
 import { OpenAICompatProvider } from '../../OpenAICompatProvider.js';
 import type { CodexProvider } from '../../CodexProvider.js';
 import { getSelectedProvider, recordCmemFallbackIfEligible, releaseCmemGatewayProbe, selectProviderForGenerator, type SelectableProvider } from '../../provider-dispatch.js';
+import { NvidiaProvider } from '../../NvidiaProvider.js';
 import type { WorkerService } from '../../../worker-service.js';
 import { BaseRouteHandler } from '../BaseRouteHandler.js';
 import { SessionEventBroadcaster } from '../../events/SessionEventBroadcaster.js';
@@ -60,6 +61,13 @@ import type { TelegramWrapupFormatterInput } from '../../../integrations/Telegra
 
 const MAX_USER_PROMPT_BYTES = 256 * 1024;
 
+export function selectAvailableProvider(input: { nvidia: boolean; openrouter: boolean; gemini: boolean }): 'claude' | 'gemini' | 'openrouter' | 'nvidia' {
+  if (input.nvidia) return 'nvidia';
+  if (input.openrouter) return 'openrouter';
+  if (input.gemini) return 'gemini';
+  return 'claude';
+}
+
 export class SessionRoutes extends BaseRouteHandler {
   // #2756 round 3: ensureGeneratorRunning is called from independent HTTP
   // request handlers (observation ingest, /summarize, /init — see
@@ -88,6 +96,7 @@ export class SessionRoutes extends BaseRouteHandler {
     private codexAgent?: CodexProvider,
     // After codexAgent, so every existing positional caller keeps its argument order.
     private openAICompatAgent?: OpenAICompatProvider,
+    private nvidiaAgent?: NvidiaProvider,
   ) {
     super();
     this.sessionManager.setTelegramWrapupFormatter?.(this.formatTelegramWrapup);
@@ -546,6 +555,7 @@ export class SessionRoutes extends BaseRouteHandler {
       sdkAgent: this.sdkAgent,
       geminiAgent: this.geminiAgent,
       openRouterAgent: this.openRouterAgent,
+      nvidiaAgent: this.nvidiaAgent,
       codexAgent: this.codexAgent,
       openAICompatAgent: this.openAICompatAgent,
       workerService: this.workerService,
@@ -645,6 +655,8 @@ export class SessionRoutes extends BaseRouteHandler {
     contentSessionId: z.string().min(1),
     last_assistant_message: z.string().optional(),
     agentId: z.string().optional(),
+    agentType: z.string().optional(),
+    transcriptPath: z.string().optional(),
     platformSource: z.string().optional(),
     observedModel: z.string().min(1).max(200).optional(),
     observedBilling: z.string().min(1).max(40).optional(),
@@ -705,11 +717,13 @@ export class SessionRoutes extends BaseRouteHandler {
   });
 
   private handleSummarizeByClaudeId = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
-    const { contentSessionId, last_assistant_message, agentId, observedModel, observedBilling, cwd } = req.body;
+    const { contentSessionId, last_assistant_message, agentId, agentType, transcriptPath, observedModel, observedBilling, cwd } = req.body;
     const outcome = await ingestSummarize({
       contentSessionId,
       platformSource: this.getPlatformSourceFromRequest(req),
       lastAssistantMessage: last_assistant_message,
+      agentType,
+      transcriptPath,
       agentId,
       observedModel,
       observedBilling,

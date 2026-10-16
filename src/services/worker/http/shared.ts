@@ -321,6 +321,8 @@ export type SessionIngestOutcome =
   | { status: 'unknown_session' };
 
 export interface SummarizePayload {
+  transcriptPath?: string;
+  agentType?: string;
   contentSessionId: string;
   /** Already normalized (normalizePlatformSource). */
   platformSource: string;
@@ -342,10 +344,6 @@ export async function ingestSummarize(
   const { sessionManager, dbManager, eventBroadcaster, ensureGeneratorRunning } = deps;
   const { contentSessionId, platformSource, observedModel, observedBilling } = payload;
 
-  if (payload.agentId) {
-    return { status: 'skipped', reason: 'subagent_context' };
-  }
-
   const store = dbManager.getSessionStore();
 
   // Summarize only a session the worker knows. Creating a row here gave every
@@ -354,6 +352,13 @@ export async function ingestSummarize(
   const sessionDbId = store.findSessionDbIdByContentSessionId(contentSessionId, platformSource);
   if (sessionDbId === null) {
     return { status: 'unknown_session' };
+  }
+
+  if (payload.transcriptPath) {
+    store.db.prepare('UPDATE sdk_sessions SET transcript_locator=? WHERE id=?').run(payload.transcriptPath, sessionDbId);
+  }
+  if (payload.agentId) {
+    return { status: 'skipped', reason: 'deferred_to_canonical_recovery' };
   }
 
   // An excluded checkout is never summarized, even one excluded after its

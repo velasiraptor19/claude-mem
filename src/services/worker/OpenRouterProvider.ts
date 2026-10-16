@@ -828,6 +828,7 @@ export class OpenRouterProvider extends OpenAICompatibleProvider<OpenRouterConfi
       headers: {
         'Authorization': `Bearer ${apiKey}`,
         ...openRouterAttributionHeaders(siteUrl, appName),
+        'Accept': 'application/json',
         'Content-Type': 'application/json',
         // Tracing only: names every send of one batch in our logs and the
         // provider's. Never treated as server-side idempotency.

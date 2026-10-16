@@ -371,6 +371,7 @@ export function ContextSettingsModal({
                   <option value="openrouter">OpenRouter / claude-mem observer</option>
                   <option value="codex">Codex (uses your ChatGPT subscription)</option>
                   <option value="openai-compatible">OpenAI-compatible endpoint (BYOK)</option>
+                  <option value="nvidia">NVIDIA NIM</option>
                 </select>
               </FormField>
 
@@ -633,6 +634,32 @@ export function ContextSettingsModal({
                       onChange={(e) => updateSetting('CLAUDE_MEM_QUOTA_FALLBACK_MODEL', e.target.value)}
                       placeholder="e.g., claude-haiku-4-5-20251001"
                     />
+                  </FormField>
+                </>
+              )}
+
+              {formState.CLAUDE_MEM_PROVIDER === 'nvidia' && (
+                <>
+                  <FormField label="NVIDIA API Key" tooltip="NVIDIA NIM API key (or set NVIDIA_API_KEY)">
+                    <input type="password" value={formState.CLAUDE_MEM_NVIDIA_API_KEY || ''} onChange={(e) => updateSetting('CLAUDE_MEM_NVIDIA_API_KEY', e.target.value)} />
+                  </FormField>
+                  <FormField label="Observation Model" tooltip="NVIDIA NIM model identifier">
+                    <input type="text" value={formState.CLAUDE_MEM_NVIDIA_OBSERVATION_MODEL || ''} onChange={(e) => updateSetting('CLAUDE_MEM_NVIDIA_OBSERVATION_MODEL', e.target.value)} />
+                  </FormField>
+                  <FormField label="Summary Model" tooltip="NVIDIA NIM model used for final summaries">
+                    <input type="text" value={formState.CLAUDE_MEM_NVIDIA_SUMMARY_MODEL || ''} onChange={(e) => updateSetting('CLAUDE_MEM_NVIDIA_SUMMARY_MODEL', e.target.value)} />
+                  </FormField>
+                  <FormField label="Base URL" tooltip="NVIDIA NIM chat completions endpoint">
+                    <input type="url" value={formState.CLAUDE_MEM_NVIDIA_BASE_URL || ''} onChange={(e) => updateSetting('CLAUDE_MEM_NVIDIA_BASE_URL', e.target.value)} />
+                  </FormField>
+                  <FormField label="Allow insecure loopback gateway" tooltip="Permit HTTP only for localhost NVIDIA-compatible development gateways">
+                    <input type="checkbox" checked={formState.CLAUDE_MEM_NVIDIA_ALLOW_INSECURE_GATEWAY === 'true'} onChange={(e) => updateSetting('CLAUDE_MEM_NVIDIA_ALLOW_INSECURE_GATEWAY', String(e.target.checked))} />
+                  </FormField>
+                  <FormField label="Max Input Tokens" tooltip="Context budget before request compaction">
+                    <input type="number" min="1" value={formState.CLAUDE_MEM_NVIDIA_MAX_INPUT_TOKENS || '30000'} onChange={(e) => updateSetting('CLAUDE_MEM_NVIDIA_MAX_INPUT_TOKENS', e.target.value)} />
+                  </FormField>
+                  <FormField label="Max Output Tokens" tooltip="Maximum generated tokens">
+                    <input type="number" min="1" value={formState.CLAUDE_MEM_NVIDIA_MAX_OUTPUT_TOKENS || '4096'} onChange={(e) => updateSetting('CLAUDE_MEM_NVIDIA_MAX_OUTPUT_TOKENS', e.target.value)} />
                   </FormField>
                 </>
               )}

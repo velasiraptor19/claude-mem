@@ -60,7 +60,7 @@ function expectedTrace(kind: ObserverRequestLabel['kind'], traceId?: string) {
 
 function chatResponse(promptTokens = 100): Response {
   return new Response(JSON.stringify({
-    choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+    choices: [{ message: { content: '<skip_summary />' }, finish_reason: 'stop' }],
     usage: { prompt_tokens: promptTokens, completion_tokens: 5, total_tokens: promptTokens + 5 },
   }), { status: 200, headers: { 'Content-Type': 'application/json' } });
 }
@@ -224,7 +224,14 @@ function makeQueue(session: ActiveSession, messages: unknown[]) {
 /** The real OpenRouter provider, pinned to one endpoint instead of reading settings for it. */
 class EndpointProvider extends OpenRouterProvider {
   constructor(sessionManager: unknown, private readonly endpoint: { apiUrl: string; apiKey: string }) {
-    super({} as never, sessionManager as never);
+    super({
+        getSessionStore: () => ({
+          ensureMemorySessionIdRegistered: (_id: number, memoryId: string) => memoryId,
+          storeObservations: () => ({ observationIds: [], summaryId: null }),
+        }),
+        getChromaSync: () => null,
+        getCloudSync: () => null,
+      } as never, sessionManager as never);
   }
 
   protected getConfig() {

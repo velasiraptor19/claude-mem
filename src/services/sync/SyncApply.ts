@@ -264,7 +264,7 @@ export interface ChromaSyncLike {
     platformSource?: string,
     replaceExisting?: boolean,
     loadCurrent?: () => CurrentRow<StoredSummary> | undefined
-  ): Promise<void>;
+  ): Promise<void | { expected: number; written: number; complete: boolean }>;
   syncUserPrompt(
     promptId: number,
     memorySessionId: string,
@@ -625,9 +625,9 @@ export class SyncApply {
   }
 
   /** Preserve hub order per row while unrelated rows can still forward concurrently. */
-  private enqueueChromaWrite(key: string, write: () => Promise<void>): Promise<void> {
+  private enqueueChromaWrite(key: string, write: () => Promise<unknown>): Promise<void> {
     const previous = this.chromaWrites.get(key) ?? Promise.resolve();
-    const next = previous.catch(() => {}).then(write);
+    const next = previous.catch(() => {}).then(async () => { await write(); });
     this.chromaWrites.set(key, next);
     const clear = () => { if (this.chromaWrites.get(key) === next) this.chromaWrites.delete(key); };
     void next.then(clear, clear);

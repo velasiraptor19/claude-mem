@@ -78,6 +78,12 @@ function makeQueue(session: ActiveSession, messages: unknown[]) {
         yield pending[0];
       }
     },
+    handleMalformedOutput: async () => {
+      // This context-budget harness models a durable recovery handoff.
+      if (claimed) pending.shift();
+      claimed = false;
+      return { retry: false, retryCount: 3 };
+    },
     confirmClaimedMessages: async () => {
       if (claimed) pending.shift();
       claimed = false;

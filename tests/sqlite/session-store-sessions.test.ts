@@ -156,5 +156,23 @@ describe('SessionStore session lifecycle', () => {
       store.updateMemorySessionId(id, 'memory-2');
       expect(store.getSessionById(id)?.memory_session_id).toBe('memory-2');
     });
+
+    it('moves an existing summary atomically when a provider changes the memory id', () => {
+      const id = store.createSDKSession('content-provider-switch', 'project', 'prompt');
+      store.updateMemorySessionId(id, 'provider-memory-1');
+      store.storeSummary('provider-memory-1', 'project', {
+        request: 'request',
+        investigated: 'investigated',
+        learned: 'learned',
+        completed: 'completed',
+        next_steps: 'next',
+        notes: null,
+      });
+
+      store.updateMemorySessionId(id, 'provider-memory-2');
+
+      expect(store.getSummaryForSession('provider-memory-1')).toBeNull();
+      expect(store.getSummaryForSession('provider-memory-2')?.request).toBe('request');
+    });
   });
 });

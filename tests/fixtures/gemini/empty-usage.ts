@@ -18,6 +18,14 @@ mode.loadMode('code');
 const barePrompt = scenario === 'init';
 const thinking = ['thought-only', 'text-with-thoughts', 'limit-with-thoughts'].includes(scenario);
 if (!barePrompt) manager.queueObservation(sessionId, { tool_name: 'Read', tool_input: JSON.stringify({file_path:'owned.ts'}), tool_response: 'owned text', prompt_number: 1, cwd: process.env.CLAUDE_MEM_DATA_DIR! });
+// Stop after the first malformed response: this fixture measures one turn's usage,
+// while the live manager still preserves it for its bounded repair lifecycle.
+const handleMalformed = manager.handleMalformedOutput.bind(manager);
+manager.handleMalformedOutput = async (...args) => {
+  const result = await handleMalformed(...args);
+  session.abortController.abort();
+  return result;
+};
 let requests = 0;
 let abortTimer: ReturnType<typeof setTimeout> | undefined;
 const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {

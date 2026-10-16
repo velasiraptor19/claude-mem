@@ -46,6 +46,7 @@ function captureHandlers(routes: SettingsRoutes): {
 }
 
 const SECRET_ENV_KEYS = [
+  'CLAUDE_MEM_NVIDIA_API_KEY',
   'CLAUDE_MEM_GEMINI_API_KEY',
   'CLAUDE_MEM_OPENROUTER_API_KEY',
   'CLAUDE_MEM_CHROMA_API_KEY',
@@ -93,9 +94,17 @@ describe('SettingsRoutes — credential redaction and host bind (#3861)', () => 
     }
   });
 
+  it('shows NVIDIA fallback as off when no fallback was selected', () => {
+    writeFileSync(settingsPath, JSON.stringify({ CLAUDE_MEM_PROVIDER: 'nvidia' }));
+    const { res, jsonSpy } = createMockRes();
+    handlers.get({ body: {}, path: '/api/settings', params: {}, query: {} } as Request, res as Response);
+    expect((jsonSpy.mock.calls[0][0] as Record<string, string>).CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER).toBe('off');
+  });
+
   it('GET /api/settings masks provider and sync secrets and leaves display prefs intact', () => {
     const secrets = {
       CLAUDE_MEM_GEMINI_API_KEY: 'gemini-secret-1234',
+      CLAUDE_MEM_NVIDIA_API_KEY: 'nvidia-secret-4567',
       CLAUDE_MEM_OPENROUTER_API_KEY: 'or-secret-5678',
       CLAUDE_MEM_CHROMA_API_KEY: 'chroma-secret-abcd',
       CLAUDE_MEM_CLOUD_SYNC_TOKEN: 'sync-token-wxyz',

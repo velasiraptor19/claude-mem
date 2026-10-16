@@ -353,6 +353,13 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
     );
   }
 
+  /** Allow first-class providers to select a dedicated summary model/config. */
+  protected getSummaryConfig(config: TConfig): TConfig {
+    const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+    const summaryModel = resolveSummaryTierModel(config.model, settings);
+    return summaryModel === config.model ? config : { ...config, model: summaryModel };
+  }
+
   async startSession(session: ActiveSession, worker?: WorkerRef): Promise<void> {
     const config = this.getConfig();
     const { apiKey, model } = config;
@@ -630,9 +637,8 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
 
     session.lastPromptSentAt = Date.now();
     session.lastGeneratorSource = 'summarize';
-    const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
-    const summaryModel = resolveSummaryTierModel(config.model, settings);
-    const summaryConfig = summaryModel === config.model ? config : { ...config, model: summaryModel };
+    const summaryConfig = this.getSummaryConfig(config);
+    const summaryModel = summaryConfig.model;
     if (summaryConfig !== config) {
       logger.debug('SESSION', 'Tier routing: summary model', {
         sessionId: session.sessionDbId, model: summaryModel

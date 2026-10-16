@@ -3,7 +3,7 @@ import type { Response } from 'express';
 import type { PaidSendBudget } from './worker/paid-send-budget.js';
 
 export interface ConversationMessage {
-  role: 'user' | 'assistant';
+  role: 'system' | 'user' | 'assistant';
   content: string;
   /**
    * Set on a generation's init or continuation prompt (openObserverGeneration).
@@ -28,7 +28,7 @@ export interface ActiveSession {
   earliestPendingTimestamp: number | null;  
   claimedMessageIds: number[];
   conversationHistory: ConversationMessage[];  
-  currentProvider: 'claude' | 'gemini' | 'openrouter' | 'codex' | 'openai-compatible' | null;
+  currentProvider: 'claude' | 'gemini' | 'openrouter' | 'nvidia' | 'codex' | 'openai-compatible' | null;
   /**
    * Claude account (config-dir profile key) the latest Claude generator was
    * spawned under. Its env, and so its billing account, is fixed at spawn, so
@@ -41,7 +41,7 @@ export interface ActiveSession {
    * (the provider fallback), else null/undefined. A stand-in that is refused
    * must not strand the work: the primary takes it back once it recovers.
    */
-  fallbackFrom?: 'claude' | 'gemini' | 'openrouter' | 'codex' | 'openai-compatible' | null;
+  fallbackFrom?: 'claude' | 'gemini' | 'openrouter' | 'nvidia' | 'codex' | 'openai-compatible' | null;
   consecutiveRestarts: number;
   /**
    * Rejected replies (neither observation/summary XML nor the

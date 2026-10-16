@@ -6,7 +6,7 @@
  */
 
 import { existsSync, readFileSync } from 'fs';
-import { join } from 'path';
+import { dirname, join } from 'path';
 import { styleText } from 'node:util';
 import { IS_WINDOWS, marketplaceDirectory, readPluginVersion } from '../utils/paths.js';
 import { formatHostForUrl, getWorkerHost, getWorkerPort, resolvePluginRoot, type PluginRootResolution } from '../../shared/worker-utils.js';
@@ -30,6 +30,9 @@ import {
   type LauncherHostEnvironment,
 } from '../../launcher/install-launcher.js';
 import { LAUNCHER_PROTOCOL } from '../../launcher/launcher-protocol.js';
+import { DB_PATH } from '../../shared/paths.js';
+import { buildReleaseIdentity, buildStoreTopologyIdentity, type ReleaseIdentityV1, type StoreTopologyIdentityV1 } from '../../services/release/attestation.js';
+import { resolveWorkerScriptPath } from '../../shared/worker-utils.js';
 
 type CheckStatus = 'ok' | 'warn' | 'fail';
 
@@ -332,7 +335,14 @@ export function claudeCodeVersionCheck(detectedClaudeCodeVersion: string | undef
   };
 }
 
-export async function runDoctorCommand(): Promise<void> {
+export interface DoctorJsonV1 {
+  schemaVersion: 1;
+  releaseIdentity: ReleaseIdentityV1;
+  storeTopologyIdentity: StoreTopologyIdentityV1;
+  operationalSnapshot: { generatedAt: string; checks: Array<Pick<CheckResult, 'name' | 'status' | 'required'>> };
+}
+
+export async function runDoctorCommand(options: { json?: boolean } = {}): Promise<void> {
   const checks: CheckResult[] = [];
   const dataDir = resolveDataDir();
 
@@ -414,11 +424,14 @@ export async function runDoctorCommand(): Promise<void> {
   let workerStatus: CheckStatus = 'fail';
   let workerDetail = `no response at http://${formatHostForUrl(workerHost)}:${workerPort} — start with \`npx claude-mem start\``;
   let chromaChecks: CheckResult[] = [];
+  let workerHealthPayload: Record<string, unknown> | null = null;
   try {
     const worker = await probeWorkerHealth(workerHost, workerPort);
     workerStatus = worker.status;
     workerDetail = worker.detail;
     chromaChecks = await probeChromaDiagnostics(worker.workerUrl);
+    const response = await fetch(`http://${formatHostForUrl(workerHost)}:${workerPort}/api/health`, { signal: AbortSignal.timeout(3000) });
+    workerHealthPayload = await response.json() as Record<string, unknown>;
   } catch {
     // leave as fail
   }
@@ -465,6 +478,49 @@ export async function runDoctorCommand(): Promise<void> {
       detail,
       required: false,
     });
+  }
+
+  const workerPath = typeof workerHealthPayload?.workerPath === 'string'
+    ? workerHealthPayload.workerPath
+    : join(marketplaceDir, 'plugin', 'scripts', 'worker-service.cjs');
+  // The resolver is the same artifact selector used by hooks/restart.  Never
+  // print either path: a boolean compatibility verdict is the public surface.
+  const hookWorkerPath = resolveWorkerScriptPath();
+  const workerManifestPath = join(dirname(workerPath), '..', '.claude-plugin', 'plugin.json');
+  const workerVersion = typeof workerHealthPayload?.version === 'string' ? workerHealthPayload.version : null;
+  const workerPid = typeof workerHealthPayload?.pid === 'number' ? workerHealthPayload.pid : null;
+  const managedVersion = readPluginVersion();
+  const releaseIdentity = buildReleaseIdentity({
+    managedPluginVersion: managedVersion,
+    workerVersion,
+    workerBundlePath: workerPath,
+    manifestPath: workerManifestPath,
+    workerEndpoint: `${workerHost}:${workerPort}`,
+    workerHealth: workerStatus === 'ok' ? 'healthy' : workerStatus === 'warn' ? 'unhealthy' : 'unreachable',
+    workerPid,
+    hookWorkerPath,
+    dataDir,
+  });
+  const artifactCompatible = workerVersion === null ? installed : workerVersion === managedVersion;
+  const storeTopologyIdentity = buildStoreTopologyIdentity({
+    dataDir,
+    dbPath: DB_PATH,
+    codexCompatible: artifactCompatible,
+    claudeCompatible: installed && artifactCompatible,
+  });
+  const json: DoctorJsonV1 = {
+    schemaVersion: 1,
+    releaseIdentity,
+    storeTopologyIdentity,
+    operationalSnapshot: {
+      generatedAt: new Date().toISOString(),
+      checks: checks.map(({ name, status, required }) => ({ name, status, required })),
+    },
+  };
+
+  if (options.json) {
+    console.log(JSON.stringify(json));
+    return;
   }
 
   const icon = (s: CheckStatus): string =>

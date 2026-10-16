@@ -6,6 +6,7 @@ import type { ClaudeProvider } from '../ClaudeProvider.js';
 import type { GeminiProvider } from '../GeminiProvider.js';
 import type { OpenRouterProvider } from '../OpenRouterProvider.js';
 import type { OpenAICompatProvider } from '../OpenAICompatProvider.js';
+import type { NvidiaProvider } from '../NvidiaProvider.js';
 import type { CodexProvider } from '../CodexProvider.js';
 import type { SessionCompletionHandler } from './SessionCompletionHandler.js';
 import {
@@ -54,6 +55,7 @@ export interface GeneratorRunnerDependencies {
   openRouterAgent: OpenRouterProvider;
   /** Absent only in harnesses that never select Codex. */
   codexAgent?: CodexProvider;
+  nvidiaAgent?: NvidiaProvider;
   /** Absent only in harnesses that never select openai-compatible. */
   openAICompatAgent?: OpenAICompatProvider;
   workerService: WorkerService;
@@ -141,7 +143,7 @@ export async function startGeneratorWithProvider(
   gatewayProbeClaimId: number | null,
   deps: GeneratorRunnerDependencies,
 ): Promise<void> {
-  const { sessionManager, sdkAgent, geminiAgent, openRouterAgent, codexAgent, openAICompatAgent, workerService,
+  const { sessionManager, sdkAgent, geminiAgent, openRouterAgent, codexAgent, nvidiaAgent, openAICompatAgent, workerService,
     completionHandler, ensureGeneratorRunning, maybeSelfHealStaleClaudeSpawn } = deps;
   if (!session) return;
 
@@ -166,7 +168,7 @@ export async function startGeneratorWithProvider(
     session.abortController = new AbortController();
   }
 
-  const agent = provider === 'codex'
+  const agent = provider === 'nvidia' ? nvidiaAgent : provider === 'codex'
     ? codexAgent
     : provider === 'openrouter'
       ? openRouterAgent
@@ -175,7 +177,7 @@ export async function startGeneratorWithProvider(
         : provider === 'openai-compatible'
           ? openAICompatAgent
           : sdkAgent;
-  const agentName = provider === 'codex'
+  const agentName = provider === 'nvidia' ? 'NVIDIA NIM' : provider === 'codex'
     ? 'Codex'
     : provider === 'openrouter'
       ? 'OpenRouter'

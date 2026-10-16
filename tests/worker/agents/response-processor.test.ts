@@ -751,12 +751,15 @@ describe('ResponseProcessor', () => {
   });
 
   describe('non-XML observer responses', () => {
-    it('warns and clears pending work when the observer returns non-XML prose', async () => {
+    it('requests a bounded repair without confirming malformed work', async () => {
       const confirmClaimedMessages = mock(() => Promise.resolve(0));
+      const handleMalformedOutput = mock(() => Promise.resolve({ retry: true, retryCount: 1 }));
       mockSessionManager = {
+        handleMalformedOutput: mock(() => Promise.resolve({ retry: true, retryCount: 1 })),
         getMessageIterator: async function* () { yield* []; },
         getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
         confirmClaimedMessages,
+        handleMalformedOutput,
       } as unknown as SessionManager;
 
       const session = createMockSession();
@@ -775,11 +778,12 @@ describe('ResponseProcessor', () => {
 
       expect(logger.warn).toHaveBeenCalledWith(
         'PARSER',
-        expect.stringMatching(/^TestAgent returned non-XML prose response/),
+        expect.stringMatching(/^TestAgent returned non-XML prose response — retrying/),
         expect.objectContaining({ sessionId: 1, outputClass: 'prose' })
       );
-      expect(confirmClaimedMessages).toHaveBeenCalledWith(1);
-      expect(session.earliestPendingTimestamp).toBeNull();
+      expect(handleMalformedOutput).toHaveBeenCalledWith(1, expect.objectContaining({ outputClass: 'prose' }));
+      expect(confirmClaimedMessages).not.toHaveBeenCalled();
+      expect(session.conversationHistory.at(-1)?.content).toContain('REPAIR REQUIRED');
       expect(mockStoreObservations).not.toHaveBeenCalled();
     });
 
@@ -791,6 +795,7 @@ describe('ResponseProcessor', () => {
       const confirmClaimedMessages = mock(() => Promise.resolve(0));
       const resetProcessingToPending = mock(() => Promise.resolve(0));
       mockSessionManager = {
+        handleMalformedOutput: mock(() => Promise.resolve({ retry: true, retryCount: 1 })),
         getMessageIterator: async function* () { yield* []; },
         getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
         confirmClaimedMessages,
@@ -824,6 +829,7 @@ describe('ResponseProcessor', () => {
       const confirmClaimedMessages = mock(() => Promise.resolve(0));
       const resetProcessingToPending = mock(() => Promise.resolve(0));
       mockSessionManager = {
+        handleMalformedOutput: mock(() => Promise.resolve({ retry: true, retryCount: 1 })),
         getMessageIterator: async function* () { yield* []; },
         getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
         confirmClaimedMessages,
@@ -851,6 +857,7 @@ describe('ResponseProcessor', () => {
 
     it('pauses the generator with a preserving abort reason on transport failure', async () => {
       mockSessionManager = {
+        handleMalformedOutput: mock(() => Promise.resolve({ retry: true, retryCount: 1 })),
         getMessageIterator: async function* () { yield* []; },
         getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
         confirmClaimedMessages: mock(() => Promise.resolve(0)),
@@ -881,62 +888,49 @@ describe('ResponseProcessor', () => {
       );
     });
 
-    it('still confirms ordinary prose so low-signal batches do not loop', async () => {
-      const confirmClaimedMessages = mock(() => Promise.resolve(0));
-      const resetProcessingToPending = mock(() => Promise.resolve(0));
+    it('preserves an exhausted malformed batch and does not add more repair prompts', async () => {
+      const handleMalformedOutput = mock(() => Promise.resolve({ retry: false, retryCount: 3 }));
       mockSessionManager = {
-        getMessageIterator: async function* () { yield* []; },
-        getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
-        confirmClaimedMessages,
-        resetProcessingToPending,
+        handleMalformedOutput,
+        confirmClaimedMessages: mock(() => Promise.resolve(0)),
       } as unknown as SessionManager;
-
       const session = createMockSession();
 
       await processAgentResponse(
-        'Traced the flake to a proxy that drops idle sockets; the retry now handles the connection reset.',
-        session,
-        mockDbManager,
-        mockSessionManager,
-        mockWorker,
-        100,
-        null,
-        'TestAgent'
+        'Still not XML', session, mockDbManager, mockSessionManager, mockWorker,
+        100, null, 'TestAgent'
       );
 
-      expect(confirmClaimedMessages).toHaveBeenCalledWith(1);
-      expect(resetProcessingToPending).not.toHaveBeenCalled();
+      expect(session.consecutiveInvalidOutputs).toBe(3);
+      expect(session.conversationHistory.filter(message => message.content.includes('REPAIR REQUIRED'))).toHaveLength(0);
+      expect(logger.warn).toHaveBeenCalledWith(
+        'PARSER',
+        expect.stringContaining('retries exhausted; preserving batch for recovery'),
+        expect.objectContaining({ sessionId: 1, outputClass: 'prose' }),
+      );
     });
 
-    // The same guarantee one punctuation mark over: a completed observation
-    // that opens with an envelope AND a colon must still be confirmed, or the
-    // session pauses and retries work that already finished.
-    it('still confirms a punctuated envelope narrative', async () => {
-      const confirmClaimedMessages = mock(() => Promise.resolve(0));
-      const resetProcessingToPending = mock(() => Promise.resolve(0));
+    it.each([
+      ['auth', 'Failed to authenticate: OAuth session expired and could not be refreshed'],
+      ['quota', 'Claude weekly usage limit reached; try again after reset'],
+    ])('preserves claimed work for %s prose without consuming malformed retries', async (_kind, responseText) => {
+      const resetProcessingToPending = mock(() => Promise.resolve(1));
+      const handleMalformedOutput = mock(() => Promise.resolve({ retry: true, retryCount: 1 }));
       mockSessionManager = {
-        getMessageIterator: async function* () { yield* []; },
-        getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
-        confirmClaimedMessages,
         resetProcessingToPending,
+        handleMalformedOutput,
       } as unknown as SessionManager;
-
       const session = createMockSession();
 
       await processAgentResponse(
-        'Network error: recovery is already covered by the retry wrapper',
-        session,
-        mockDbManager,
-        mockSessionManager,
-        mockWorker,
-        100,
-        null,
-        'TestAgent'
+        responseText, session, mockDbManager, mockSessionManager, mockWorker,
+        100, null, 'TestAgent'
       );
 
-      expect(confirmClaimedMessages).toHaveBeenCalledWith(1);
-      expect(resetProcessingToPending).not.toHaveBeenCalled();
-      expect(session.abortController.signal.aborted).toBe(false);
+      expect(resetProcessingToPending).toHaveBeenCalledWith(1);
+      expect(handleMalformedOutput).not.toHaveBeenCalled();
+      expect(session.consecutiveInvalidOutputs).toBe(0);
+      expect(session.abortController.signal.aborted).toBe(true);
     });
   });
 
@@ -946,6 +940,7 @@ describe('ResponseProcessor', () => {
       const resetProcessingToPending = mock(() => Promise.resolve(1));
       const confirmClaimedMessages = mock(() => Promise.resolve(0));
       mockSessionManager = {
+        handleMalformedOutput: mock(() => Promise.resolve({ retry: true, retryCount: 1 })),
         getMessageIterator: async function* () { yield* []; },
         getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
         confirmClaimedMessages,
@@ -1042,8 +1037,10 @@ describe('ResponseProcessor', () => {
       expect(session.consecutiveContextOverflows).toBe(0);
     });
 
-    it('still treats ordinary prose as a benign skip, not an overflow', async () => {
+    it('still treats ordinary prose as malformed output, not an overflow', async () => {
       const { resetProcessingToPending, confirmClaimedMessages } = overflowSessionManager();
+      const handleMalformedOutput = mock(() => Promise.resolve({ retry: true, retryCount: 1 }));
+      mockSessionManager.handleMalformedOutput = handleMalformedOutput;
       const session = createMockSession();
 
       await processAgentResponse(
@@ -1051,7 +1048,8 @@ describe('ResponseProcessor', () => {
         mockSessionManager, mockWorker, 100, null, 'TestAgent'
       );
 
-      expect(confirmClaimedMessages).toHaveBeenCalledWith(1);
+      expect(handleMalformedOutput).toHaveBeenCalledWith(1, expect.objectContaining({ outputClass: 'prose' }));
+      expect(confirmClaimedMessages).not.toHaveBeenCalled();
       expect(resetProcessingToPending).not.toHaveBeenCalled();
       expect(session.consecutiveContextOverflows).toBe(0);
       expect(session.forceInit).toBeUndefined();
@@ -1091,6 +1089,7 @@ describe('ResponseProcessor', () => {
     });
 
     it('does NOT record an interaction for ordinary non-auth prose', async () => {
+      mockSessionManager.handleMalformedOutput = mock(() => Promise.resolve({ retry: true, retryCount: 1 }));
       const session = createMockSession();
       const responseText = 'Skipping — repeated log scan with no new findings.';
 
@@ -1353,6 +1352,7 @@ describe('ResponseProcessor', () => {
       } as StorageResult));
       const confirmClaimedMessages = mock(() => Promise.resolve(1));
       mockSessionManager = {
+        handleMalformedOutput: mock(() => Promise.resolve({ retry: true, retryCount: 1 })),
         getMessageIterator: async function* () { yield* []; },
         getClaimedMessages: mock(() => []),
         confirmClaimedMessages,
@@ -1382,9 +1382,10 @@ describe('ResponseProcessor', () => {
       expect(logger.warn).not.toHaveBeenCalled();
     });
 
-    it('clears pending work and does NOT call storeObservations on empty response', async () => {
+    it('retries pending work and does NOT call storeObservations on empty response', async () => {
       const confirmClaimedMessages = mock(() => Promise.resolve(0));
       mockSessionManager = {
+        handleMalformedOutput: mock(() => Promise.resolve({ retry: true, retryCount: 1 })),
         getMessageIterator: async function* () { yield* []; },
         getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
         confirmClaimedMessages,
@@ -1399,13 +1400,13 @@ describe('ResponseProcessor', () => {
       );
 
       expect(mockStoreObservations).not.toHaveBeenCalled();
-      expect(confirmClaimedMessages).toHaveBeenCalledWith(1);
-      expect(session.earliestPendingTimestamp).toBeNull();
+      expect(confirmClaimedMessages).not.toHaveBeenCalled();
     });
 
-    it('clears pending work and does NOT call storeObservations on plain-text response', async () => {
+    it('retries pending work and does NOT call storeObservations on plain-text response', async () => {
       const confirmClaimedMessages = mock(() => Promise.resolve(0));
       mockSessionManager = {
+        handleMalformedOutput: mock(() => Promise.resolve({ retry: true, retryCount: 1 })),
         getMessageIterator: async function* () { yield* []; },
         getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
         confirmClaimedMessages,
@@ -1420,8 +1421,7 @@ describe('ResponseProcessor', () => {
       );
 
       expect(mockStoreObservations).not.toHaveBeenCalled();
-      expect(confirmClaimedMessages).toHaveBeenCalledWith(1);
-      expect(session.earliestPendingTimestamp).toBeNull();
+      expect(confirmClaimedMessages).not.toHaveBeenCalled();
     });
 
     // #3454: the idle WARN line names why the turn was empty (block kinds
@@ -1429,6 +1429,7 @@ describe('ResponseProcessor', () => {
     // only thinking/tool_use blocks" in the field.
     it('names the empty-turn shape on the idle WARN line', async () => {
       mockSessionManager = {
+        handleMalformedOutput: mock(() => Promise.resolve({ retry: true, retryCount: 1 })),
         getMessageIterator: async function* () { yield* []; },
         getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
         confirmClaimedMessages: mock(() => Promise.resolve(0)),
@@ -1449,6 +1450,7 @@ describe('ResponseProcessor', () => {
 
     it('does not attach an empty-turn shape to a prose response', async () => {
       mockSessionManager = {
+        handleMalformedOutput: mock(() => Promise.resolve({ retry: true, retryCount: 1 })),
         getMessageIterator: async function* () { yield* []; },
         getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
         confirmClaimedMessages: mock(() => Promise.resolve(0)),
@@ -1595,6 +1597,7 @@ describe('ResponseProcessor', () => {
     it('should reset processing work if memorySessionId is missing from session', async () => {
       const resetProcessingToPending = mock(() => Promise.resolve(1));
       mockSessionManager = {
+        handleMalformedOutput: mock(() => Promise.resolve({ retry: true, retryCount: 1 })),
         getMessageIterator: async function* () { yield* []; },
         resetProcessingToPending,
       } as unknown as SessionManager;
@@ -1631,6 +1634,7 @@ describe('ResponseProcessor', () => {
       const confirmClaimedMessages = mock(() => Promise.resolve(0));
       const resetProcessingToPending = mock(() => Promise.resolve(1));
       mockSessionManager = {
+        handleMalformedOutput: mock(() => Promise.resolve({ retry: true, retryCount: 1 })),
         getMessageIterator: async function* () { yield* []; },
         confirmClaimedMessages,
         resetProcessingToPending,
@@ -1657,6 +1661,7 @@ describe('ResponseProcessor', () => {
       const confirmClaimedMessages = mock(async () => 0);
       const resetProcessingToPending = mock(async () => 1);
       const mockSessionManager = {
+        handleMalformedOutput: mock(() => Promise.resolve({ retry: true, retryCount: 1 })),
         getMessageIterator: async function* () { yield* []; },
         getPendingMessageStore: () => ({ markProcessed: mock(() => {}) }),
         confirmClaimedMessages,
@@ -1725,6 +1730,7 @@ describe('ResponseProcessor', () => {
       const confirmClaimedMessages = mock(() => Promise.resolve(1));
       const resetProcessingToPending = mock(() => Promise.resolve(1));
       mockSessionManager = {
+        handleMalformedOutput: mock(() => Promise.resolve({ retry: true, retryCount: 1 })),
         getMessageIterator: async function* () { yield* []; },
         getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
         getClaimedMessages: mock(() => []),

@@ -165,6 +165,7 @@ describe('OpenAICompatibleProvider init response', () => {
     const manager = {
       ...sessionManager,
       resetProcessingToPending,
+      handleMalformedOutput: mock(() => Promise.resolve({ retry: true, retryCount: 1 })),
       getMessageIterator: async function* () {
         session.claimedMessageIds.push(7);
         yield { type: 'observation', tool_name: 'Read', tool_input: { file_path: 'src/main.ts' }, tool_response: 'file contents', prompt_number: 1 };
@@ -181,8 +182,8 @@ describe('OpenAICompatibleProvider init response', () => {
     // One reply per request: no in-provider retry and no transport pause. The
     // queued batch goes back to pending for one more try in a fresh generation.
     expect(turns).toHaveBeenCalledTimes(2);
-    expect(session.abortReason).toBe('output_retry:idle');
-    expect(resetProcessingToPending).toHaveBeenCalled();
+    expect(session.abortReason).toBeUndefined();
+    expect(manager.handleMalformedOutput).toHaveBeenCalled();
     expect(storeObservations).not.toHaveBeenCalled();
   });
 });

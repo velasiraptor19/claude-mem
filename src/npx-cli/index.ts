@@ -25,8 +25,8 @@ ${styleText('bold', 'Install Commands')} (no Bun required):
   ${styleText('cyan', 'npx claude-mem install')}              Interactive install (also puts the claude-mem hook launcher on PATH)
   ${styleText('cyan', 'npx claude-mem install --ide <id>')}   Install for specific IDE
   ${styleText('cyan', 'npx claude-mem install --ide dsh --dsh-profile <name>')}   Install DeepSeek Harness (default profile: web)
-  ${styleText('cyan', 'npx claude-mem install --provider claude|codex|gemini|openrouter|host')}   Set LLM provider (optional non-interactively; a fresh install defaults to claude)
-  ${styleText('cyan', 'npx claude-mem install --model <id>')}   Set Claude or Codex model (when provider=claude|codex)
+  ${styleText('cyan', 'npx claude-mem install --provider claude|codex|gemini|openrouter|host|nvidia')}   Set LLM provider (optional non-interactively; a fresh install defaults to claude)
+  ${styleText('cyan', 'npx claude-mem install --model <id>')}   Set Claude or Codex model or both NVIDIA tiers (when provider=claude|codex|nvidia)
   ${styleText('cyan', 'npx claude-mem install --no-auto-start')}   Skip worker auto-start at the end
   ${styleText('cyan', 'npx claude-mem install --disable-auto-memory')}   Explicitly disable Claude Code native auto-memory
   ${styleText('cyan', 'npx claude-mem install --runtime worker|server')}   Select runtime non-interactively (server prints the docker compose command for pg+redis without running it, and provisions a hook API key only when CLAUDE_MEM_SERVER_DATABASE_URL is set; otherwise set CLAUDE_MEM_SERVER_DATABASE_URL before running npx claude-mem server keys rotate once Postgres is up)
@@ -100,8 +100,8 @@ function parseInstallOptions(argv: string[]): InstallOptions {
   const flag = (name: string): string | undefined =>
     typeof values[name] === 'string' ? (values[name] as string) : undefined;
   const provider = flag('provider');
-  if (provider !== undefined && provider !== 'claude' && provider !== 'codex' && provider !== 'gemini' && provider !== 'openrouter' && provider !== 'host') {
-    console.error(`Unknown --provider: ${provider}. Allowed: claude, codex, gemini, openrouter, host`);
+  if (provider !== undefined && provider !== 'claude' && provider !== 'codex' && provider !== 'gemini' && provider !== 'openrouter' && provider !== 'host' && provider !== 'nvidia') {
+    console.error(`Unknown --provider: ${provider}. Allowed: claude, codex, gemini, openrouter, host, nvidia`);
     process.exit(1);
   }
   const runtime = flag('runtime');
@@ -213,7 +213,7 @@ async function main(): Promise<void> {
 
     case 'doctor': {
       const { runDoctorCommand } = await import('./commands/doctor.js');
-      await runDoctorCommand();
+      await runDoctorCommand({ json: args.slice(1).includes('--json') });
       break;
     }
 

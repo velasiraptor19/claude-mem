@@ -27,6 +27,7 @@
 
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
 import { paths } from '../../shared/paths.js';
+import { readFlatSettings } from '../../npx-cli/utils/settings.js';
 import { logger } from '../../utils/logger.js';
 import { isCmemGatewayUrl, writeProFallbackAt, type ProFallbackNotice } from '../../shared/cmem-gateway.js';
 import { scrubErrorMessage } from '../../shared/observer-health.js';
@@ -56,7 +57,8 @@ import {
  * src/shared/openai-compat-presets.ts for why it is not folded into
  * openrouter.
  */
-export type SelectableProvider = 'claude' | 'gemini' | 'openrouter' | 'codex' | 'openai-compatible';
+export type SelectableProvider = 'claude' | 'gemini' | 'openrouter' | 'codex' | 'openai-compatible' | 'nvidia';
+import { isNvidiaSelected } from './NvidiaProvider.js';
 
 /** Retry a fallen-back gateway occasionally so a later subscription recovers. */
 export const CMEM_FALLBACK_RETRY_MS = 15 * 60_000;
@@ -115,6 +117,15 @@ export const QUOTA_FALLBACK_OFF = 'off';
  */
 export function readQuotaFallbackProvider(): QuotaFallbackProvider | null {
   const settings = SettingsDefaultsManager.loadFromFile(paths.settings());
+  if (settings.CLAUDE_MEM_PROVIDER === 'nvidia') {
+    // Upgrades must not opt an existing NVIDIA installation into another provider.
+    let configured: unknown;
+    try {
+      configured = process.env.CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER
+        ?? readFlatSettings(paths.settings())?.CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER;
+    } catch { return null; }
+    if (typeof configured !== 'string' || !configured.trim()) return null;
+  }
   const raw = String(settings.CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER ?? '').trim();
   if (raw === '') return 'claude';
   return (QUOTA_FALLBACK_PROVIDERS as readonly string[]).includes(raw) ? raw as QuotaFallbackProvider : null;
@@ -321,6 +332,7 @@ export function resetQuotaFallbackStateForTesting(): void {
  */
 export function getSelectedProvider(): SelectableProvider {
   if (isCodexSelected()) return applyQuotaFallback('codex').provider;
+  if (isNvidiaSelected()) return applyQuotaFallback('nvidia').provider;
   if (isOpenRouterSelected() && isOpenRouterAvailable()) {
     const settings = SettingsDefaultsManager.loadFromFile(paths.settings());
     if (
@@ -390,6 +402,9 @@ setUnservableProviderRouter((provider, message, window, profile) =>
  */
 export function selectProviderForGenerator(): ProviderSelection {
   if (isCodexSelected()) return selectWithQuotaFallback('codex');
+  if (isNvidiaSelected()) {
+    return selectWithQuotaFallback('nvidia');
+  }
   if (isOpenRouterSelected() && isOpenRouterAvailable()) {
     const settings = SettingsDefaultsManager.loadFromFile(paths.settings());
     if (settings.CLAUDE_MEM_PRO_FALLBACK_AT && isCmemGatewayUrl(settings.CLAUDE_MEM_OPENROUTER_BASE_URL)) {

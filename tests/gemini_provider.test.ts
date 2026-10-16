@@ -161,6 +161,7 @@ describe('GeminiProvider', () => {
       getClaimedMessages: mock(() => []),
       confirmClaimedMessages: mock(() => Promise.resolve(0)),
       resetProcessingToPending: mock(() => Promise.resolve(0)),
+      handleMalformedOutput: mock(() => Promise.resolve({ retry: true, retryCount: 1 })),
       getMessageBuffer: () => mockPendingMessageStore,
     } as unknown as SessionManager;
 

@@ -222,6 +222,16 @@ export interface SettingsDefaults {
   CLAUDE_MEM_QUOTA_THRESHOLD_SEVEN_DAY_OPUS: string;
   CLAUDE_MEM_QUOTA_THRESHOLD_SEVEN_DAY_SONNET: string;
   CLAUDE_MEM_QUOTA_THRESHOLD_OVERAGE: string;
+  CLAUDE_MEM_NVIDIA_API_KEY: string;
+  CLAUDE_MEM_NVIDIA_BASE_URL: string;
+  CLAUDE_MEM_NVIDIA_OBSERVATION_MODEL: string;
+  CLAUDE_MEM_NVIDIA_SUMMARY_MODEL: string;
+  CLAUDE_MEM_NVIDIA_MAX_INPUT_TOKENS: string;
+  CLAUDE_MEM_NVIDIA_MAX_OUTPUT_TOKENS: string;
+  CLAUDE_MEM_NVIDIA_TEMPERATURE: string;
+  CLAUDE_MEM_NVIDIA_TOP_P: string;
+  CLAUDE_MEM_NVIDIA_RPM_LIMIT: string;
+  CLAUDE_MEM_NVIDIA_ALLOW_INSECURE_GATEWAY: string;
   CLAUDE_MEM_DATA_DIR: string;
   CLAUDE_MEM_LOG_LEVEL: string;
   CLAUDE_MEM_PYTHON_VERSION: string;
@@ -481,6 +491,16 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_QUOTA_THRESHOLD_SEVEN_DAY_OPUS: '0.93',
     CLAUDE_MEM_QUOTA_THRESHOLD_SEVEN_DAY_SONNET: '0.92',
     CLAUDE_MEM_QUOTA_THRESHOLD_OVERAGE: '0.95',
+    CLAUDE_MEM_NVIDIA_API_KEY: '',
+    CLAUDE_MEM_NVIDIA_BASE_URL: 'https://integrate.api.nvidia.com/v1/chat/completions',
+    CLAUDE_MEM_NVIDIA_OBSERVATION_MODEL: 'nvidia/nemotron-3.5-lightning-30b-a3b',
+    CLAUDE_MEM_NVIDIA_SUMMARY_MODEL: 'nvidia/nemotron-3.5-lightning-30b-a3b',
+    CLAUDE_MEM_NVIDIA_MAX_INPUT_TOKENS: '30000',
+    CLAUDE_MEM_NVIDIA_MAX_OUTPUT_TOKENS: '4096',
+    CLAUDE_MEM_NVIDIA_TEMPERATURE: '0.1',
+    CLAUDE_MEM_NVIDIA_TOP_P: '0.8',
+    CLAUDE_MEM_NVIDIA_RPM_LIMIT: '40',
+    CLAUDE_MEM_NVIDIA_ALLOW_INSECURE_GATEWAY: 'false',
     CLAUDE_MEM_DATA_DIR: join(homedir(), '.claude-mem'),
     CLAUDE_MEM_LOG_LEVEL: 'INFO',
     CLAUDE_MEM_PYTHON_VERSION: '3.13',
@@ -865,7 +885,14 @@ export class SettingsDefaultsManager {
         }
       }
 
-      return this.finalizeSettings(result, applyEnvOverrides);
+      const finalized = this.finalizeSettings(result, applyEnvOverrides);
+      const explicitFallback = (applyEnvOverrides ? process.env.CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER : undefined)
+        ?? flatSettings.CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER;
+      // Keep the viewer's read/save roundtrip from enabling a new NVIDIA fallback.
+      if (finalized.CLAUDE_MEM_PROVIDER === 'nvidia' && !String(explicitFallback ?? '').trim()) {
+        finalized.CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER = 'off';
+      }
+      return finalized;
     } catch (error: unknown) {
       console.warn('[SETTINGS] Failed to load settings, using defaults:', settingsPath, error instanceof Error ? error.message : String(error));
       const defaults = this.getAllDefaults();

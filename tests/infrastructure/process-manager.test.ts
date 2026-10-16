@@ -664,12 +664,13 @@ describe('ProcessManager', () => {
     it.if(process.platform === 'linux')('accepts a tokenless worker identified by its command line', async () => {
       const workerDir = mkdtempSync(path.join(tmpdir(), 'claude-mem-legacy-worker-'));
       const workerScript = path.join(workerDir, 'worker-service.cjs');
-      writeFileSync(workerScript, 'setInterval(() => {}, 1000);\n');
-      const worker = spawn(process.execPath, [workerScript], { stdio: 'ignore' });
+      writeFileSync(workerScript, 'process.stdout.write("ready"); setInterval(() => {}, 1000);\n');
+      const worker = spawn(process.execPath, [workerScript], { stdio: ['ignore', 'pipe', 'ignore'] });
 
       try {
         await new Promise<void>((resolve, reject) => {
-          worker.once('spawn', resolve);
+          // spawn can precede exec; only the script itself proves its argv is installed.
+          worker.stdout!.once('data', () => resolve());
           worker.once('error', reject);
         });
         if (!worker.pid) throw new Error('Worker test process did not receive a PID');

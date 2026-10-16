@@ -337,7 +337,7 @@ describe('Gemini parity', () => {
   });
 });
 
-describe('the drop log names a truncated reply', () => {
+describe('the repair log names a truncated reply', () => {
   function makeSession(): ActiveSession {
     return {
       sessionDbId: 3868,
@@ -364,8 +364,8 @@ describe('the drop log names a truncated reply', () => {
     } as ActiveSession;
   }
 
-  const sessionManager = { confirmClaimedMessages: async () => 0, resetProcessingToPending: async () => 0 };
-  const RETRY = 'OpenRouter returned non-XML xml response — asking for the queued batch again in a fresh generation';
+  const sessionManager = { handleMalformedOutput: async () => ({ retry: true, retryCount: 1 }) };
+  const RETRY = 'OpenRouter returned non-XML xml response — retrying queued batch with XML repair guidance';
 
   it('carries finishReason and truncated for a reply cut off at the cap, then forgets it', async () => {
     const warnSpy = spyOn(logger, 'warn').mockImplementation(() => {});

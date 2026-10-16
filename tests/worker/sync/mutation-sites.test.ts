@@ -352,8 +352,9 @@ describe('mutation sites', () => {
 
   // ---------------------------------------------------------------------------
   // (c) worktree adoption — the REAL site, own connection, real git repo with
-  // a merged worktree. Summaries only (no observation ids ⇒ the site's Chroma
-  // patch is skipped — vector search is not under test here).
+  // a merged worktree. The Chroma patch is injected because vector search is
+  // covered by worktree-adoption-chroma.test.ts, while this test owns only the
+  // SQLite/outbox contract and must not start or share a process-global MCP.
   // ---------------------------------------------------------------------------
   it('adoptMergedWorktrees emits remap_project through its own connection', async () => {
     const repo = join(tempDir, 'mainrepo');
@@ -379,10 +380,27 @@ describe('mutation sites', () => {
     `).run(ISO);
     store.db.close();
 
-    const result = await adoptMergedWorktrees({ repoPath: repo, dataDirectory: dataDir });
+    const chromaTargets: unknown[] = [];
+    const result = await adoptMergedWorktrees({
+      repoPath: repo,
+      dataDirectory: dataDir,
+      // Bun module mocks are process-global and may replace project-name.ts in
+      // another test file. Pin classification so this real-git/real-DB fixture
+      // remains deterministic when executed in the full suite.
+      projectContext: cwd => {
+        const primary = cwd === repo ? 'mainrepo' : 'mainrepo/wt';
+        return { primary, parent: cwd === repo ? null : 'mainrepo', isWorktree: cwd !== repo, allProjects: [primary] };
+      },
+      chromaSync: {
+        updateMergedIntoProject: async targets => {
+          chromaTargets.push(...targets);
+        }
+      }
+    });
     expect(result.mergedBranches).toContain('feature');
     expect(result.adoptedSummaries).toBe(1);
     expect(result.adoptedObservations).toBe(0);
+    expect(chromaTargets).toEqual([{ docType: 'session_summary', sqliteId: 1 }]);
 
     const db = openConfiguredSqliteDatabase(dbPath);
     try {

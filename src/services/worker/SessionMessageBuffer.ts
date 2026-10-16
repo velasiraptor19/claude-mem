@@ -17,7 +17,15 @@ interface BufferedMessage {
   parked: boolean;
   /** The `x-client-request-id` of the batch's sends, so a parked message can be traced to them. */
   parkedClientAttemptId?: string;
+  recoveryPending: boolean;
   enqueuedAt: number;
+  malformedRetryCount: number;
+}
+
+export interface MalformedRetryResult {
+  retry: boolean;
+  retryCount: number;
+  messages: PendingMessageWithId[];
 }
 
 export interface DrainOptions {
@@ -73,7 +81,7 @@ export class SessionMessageBuffer {
     }
 
     const id = this.nextId++;
-    this.getList(sessionDbId).push({ id, message, claimed: false, parked: false, enqueuedAt });
+    this.getList(sessionDbId).push({ id, message, claimed: false, parked: false, recoveryPending: false, malformedRetryCount: 0, enqueuedAt });
     this.onMutate?.();
     this.signal(sessionDbId);
     return id;
@@ -98,7 +106,7 @@ export class SessionMessageBuffer {
     if (!list) return 0;
     let reset = 0;
     for (const m of list) {
-      if (m.claimed) {
+      if (m.claimed && !m.recoveryPending) {
         m.claimed = false;
         reset++;
       }
@@ -135,6 +143,69 @@ export class SessionMessageBuffer {
       .map(m => ({ messageId: m.id, clientAttemptId: m.parkedClientAttemptId }));
   }
 
+  /**
+   * Record a malformed model response for exactly the claimed batch.
+   * The first `maxRetries` failures are released for another in-process pass.
+   * Once exhausted, messages remain buffered and claimed so they cannot form
+   * a hot retry loop or be silently confirmed before durable recovery exists.
+   * Call markRecoveryPending() only after durable recovery enqueue succeeds.
+   */
+  recordMalformedClaim(
+    sessionDbId: number,
+    messageIds: number[],
+    maxRetries: number,
+  ): MalformedRetryResult {
+    const ids = new Set(messageIds);
+    const claimed = (this.buffers.get(sessionDbId) ?? []).filter(
+      message => ids.has(message.id) && message.claimed,
+    );
+
+    for (const message of claimed) {
+      message.malformedRetryCount++;
+    }
+
+    const retryCount = claimed.reduce(
+      (highest, message) => Math.max(highest, message.malformedRetryCount),
+      0,
+    );
+    const retry = claimed.length > 0 && retryCount <= maxRetries;
+
+    if (retry) {
+      for (const message of claimed) {
+        message.claimed = false;
+      }
+      this.signal(sessionDbId);
+    }
+
+    if (claimed.length > 0) {
+      this.onMutate?.();
+    }
+
+    return {
+      retry,
+      retryCount,
+      messages: claimed.map(message => ({
+        ...message.message,
+        _persistentId: message.id,
+        _originalTimestamp: message.enqueuedAt,
+      })),
+    };
+  }
+
+  /** Quarantine a claimed batch after its durable recovery job is committed. */
+  markRecoveryPending(sessionDbId: number, messageIds: number[]): number {
+    const ids = new Set(messageIds);
+    let marked = 0;
+    for (const message of this.buffers.get(sessionDbId) ?? []) {
+      if (ids.has(message.id) && message.claimed && !message.recoveryPending) {
+        message.recoveryPending = true;
+        marked++;
+      }
+    }
+    if (marked > 0) this.onMutate?.();
+    return marked;
+  }
+
   /** Drop everything buffered for a session. */
   clear(sessionDbId: number): number {
     const cleared = this.buffers.get(sessionDbId)?.length ?? 0;
@@ -159,13 +230,13 @@ export class SessionMessageBuffer {
 
   /** Messages still to be sent: parked ones are excluded, nothing will send them. */
   getPendingCount(sessionDbId: number): number {
-    return (this.buffers.get(sessionDbId) ?? []).filter(m => !m.parked).length;
+    return (this.buffers.get(sessionDbId) ?? []).filter(m => !m.parked && !m.recoveryPending).length;
   }
 
   getTotalDepth(): number {
     let total = 0;
     for (const list of this.buffers.values()) {
-      total += list.filter(m => !m.parked).length;
+      total += list.filter(m => !m.parked && !m.recoveryPending).length;
     }
     return total;
   }
@@ -195,7 +266,7 @@ export class SessionMessageBuffer {
   }
 
   peekTypes(sessionDbId: number): Array<{ message_type: string; tool_name: string | null }> {
-    return (this.buffers.get(sessionDbId) ?? []).filter(m => !m.parked).map(m => ({
+    return (this.buffers.get(sessionDbId) ?? []).filter(m => !m.parked && !m.recoveryPending).map(m => ({
       message_type: m.message.type,
       tool_name: m.message.tool_name ?? null
     }));
@@ -244,7 +315,7 @@ export class SessionMessageBuffer {
 
   /** Claim only the immediate FIFO head, never wait or cross a rejected barrier. */
   claimNextMatching(sessionDbId: number, accepts: (message: PendingMessageWithId) => boolean): PendingMessageWithId | null {
-    const next = this.buffers.get(sessionDbId)?.find(message => !message.claimed && !message.parked);
+    const next = this.buffers.get(sessionDbId)?.find(message => !message.claimed && !message.parked && !message.recoveryPending);
     if (!next) return null;
     const message = { ...next.message, _persistentId: next.id, _originalTimestamp: next.enqueuedAt };
     if (!accepts(message)) return null;
@@ -256,7 +327,7 @@ export class SessionMessageBuffer {
   private claimNext(sessionDbId: number): BufferedMessage | null {
     const list = this.buffers.get(sessionDbId);
     if (!list) return null;
-    const next = list.find(m => !m.claimed && !m.parked);
+    const next = list.find(m => !m.claimed && !m.parked && !m.recoveryPending);
     if (!next) return null;
     next.claimed = true;
     this.onMutate?.();

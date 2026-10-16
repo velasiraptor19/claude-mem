@@ -7,6 +7,7 @@ import {
   CMEM_FALLBACK_RETRY_MS,
   getSelectedProvider,
   quotaFallbackTarget,
+  readQuotaFallbackProvider,
   recordCmemFallbackIfEligible,
   releaseCmemGatewayProbe,
   resetQuotaFallbackStateForTesting,
@@ -91,6 +92,24 @@ describe('provider-dispatch', () => {
         : PERSONAL_KEY;
     }
   }
+
+  it('does not switch away from explicitly selected NVIDIA when its key is missing', () => {
+    const priorKey = process.env.CLAUDE_MEM_NVIDIA_API_KEY;
+    const priorAlias = process.env.NVIDIA_API_KEY;
+    process.env.CLAUDE_MEM_PROVIDER = 'nvidia';
+    process.env.CLAUDE_MEM_NVIDIA_API_KEY = '';
+    process.env.NVIDIA_API_KEY = '';
+    process.env.CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER = 'off';
+    try {
+      expect(getSelectedProvider()).toBe('nvidia');
+      expect(selectProviderForGenerator().provider).toBe('nvidia');
+    } finally {
+      if (priorKey === undefined) delete process.env.CLAUDE_MEM_NVIDIA_API_KEY;
+      else process.env.CLAUDE_MEM_NVIDIA_API_KEY = priorKey;
+      if (priorAlias === undefined) delete process.env.NVIDIA_API_KEY;
+      else process.env.NVIDIA_API_KEY = priorAlias;
+    }
+  });
 
   describe('getSelectedProvider', () => {
     it('returns openrouter when selected, keyed, and no fallback is recorded', () => {
@@ -444,6 +463,20 @@ describe('provider-dispatch', () => {
     // generator starts in every later file of the same bun process.
     afterAll(() => {
       resetQuotaCooldownsForTesting();
+    });
+
+    it('keeps NVIDIA fallback opt-in for missing and empty persisted settings', () => {
+      process.env.CLAUDE_MEM_PROVIDER = 'nvidia';
+      delete process.env.CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER;
+      const original = readFileSync(paths.settings(), 'utf8');
+      try {
+        for (const value of [undefined, '']) {
+          writeFileSync(paths.settings(), JSON.stringify({ CLAUDE_MEM_PROVIDER: 'nvidia', CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER: value }));
+          expect(readQuotaFallbackProvider()).toBeNull();
+        }
+        writeFileSync(paths.settings(), JSON.stringify({ CLAUDE_MEM_PROVIDER: 'nvidia', CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER: 'claude' }));
+        expect(readQuotaFallbackProvider()).toBe('claude');
+      } finally { writeFileSync(paths.settings(), original); }
     });
 
     it('with the fallback turned off, every primary is unchanged', () => {

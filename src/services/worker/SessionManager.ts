@@ -49,6 +49,8 @@ export class SessionManager {
   private onPendingMutate?: () => void;
   private telegramWrapupFormatter: TelegramWrapupFormatter | null = null;
   private readonly buffer = new SessionMessageBuffer(() => this.onPendingMutate?.());
+  private onMalformedOutputExhausted?: (event: MalformedOutputExhaustedEvent) => void | Promise<void>;
+
   private generatorStarter: ((sessionDbId: number, source: string) => void | Promise<void>) | null = null;
   private transportResumes = new Map<number, TransportResumeState>();
   private transportResumeReady: ReadyTransportResume[] = [];
@@ -244,6 +246,45 @@ export class SessionManager {
 
   setTelegramWrapupFormatter(formatter: TelegramWrapupFormatter): void {
     this.telegramWrapupFormatter = formatter;
+  }
+
+  setOnMalformedOutputExhausted(
+    cb: (event: MalformedOutputExhaustedEvent) => void | Promise<void>,
+  ): void {
+    this.onMalformedOutputExhausted = cb;
+  }
+
+  async handleMalformedOutput(
+    sessionDbId: number,
+    details: Omit<MalformedOutputExhaustedEvent, 'sessionDbId' | 'messages' | 'retryCount'>,
+  ): Promise<{ retry: boolean; retryCount: number }> {
+    const session = this.sessions.get(sessionDbId);
+    const claimedIds = session?.claimedMessageIds ?? [];
+    const result = this.buffer.recordMalformedClaim(sessionDbId, claimedIds, 2);
+
+    if (session) {
+      session.claimedMessageIds = [];
+    }
+
+    if (!result.retry && result.messages.length > 0) {
+      try {
+        if (!this.onMalformedOutputExhausted) throw new Error('Durable malformed recovery is not configured');
+        await this.onMalformedOutputExhausted({
+          sessionDbId,
+          retryCount: result.retryCount,
+          messages: result.messages,
+          ...details,
+        });
+        this.buffer.markRecoveryPending(sessionDbId, result.messages.map(message => message._persistentId));
+      } catch (error) {
+        logger.error('SESSION', 'Malformed-output recovery hook failed; batch remains claimable for a later durable enqueue', {
+          sessionId: sessionDbId,
+          retryCount: result.retryCount,
+        }, error instanceof Error ? error : new Error(String(error)));
+      }
+    }
+
+    return { retry: result.retry, retryCount: result.retryCount };
   }
 
   initializeSession(
@@ -880,4 +921,13 @@ export class SessionManager {
   getMessageBuffer(): SessionMessageBuffer {
     return this.buffer;
   }
+}
+
+export interface MalformedOutputExhaustedEvent {
+  sessionDbId: number;
+  outputClass: string;
+  preview: string;
+  agentName: string;
+  retryCount: number;
+  messages: PendingMessageWithId[];
 }

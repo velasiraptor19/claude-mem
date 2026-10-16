@@ -83,6 +83,7 @@ function makeSessionManager(messages: unknown[]) {
         yield message;
       }
     },
+    handleMalformedOutput: async () => ({ retry: false, retryCount: 3 }),
     confirmClaimedMessages: async () => {},
     resetProcessingToPending: async () => {},
     getClaimedMessages: () => [],

@@ -693,7 +693,7 @@ describe('SessionStore migrations', () => {
 
   it('fresh-DB init creates the SessionStore core tables', () => {
     store = new SessionStore(':memory:');
-    const expected = ['schema_versions', 'sdk_sessions', 'observations', 'session_summaries', 'user_prompts', 'pending_messages'];
+    const expected = ['schema_versions', 'sdk_sessions', 'observations', 'session_summaries', 'user_prompts', 'pending_messages', 'recovery_jobs'];
 
     for (const table of expected) {
       const row = store.db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`).get(table) as { name: string } | undefined;
@@ -727,12 +727,14 @@ describe('SessionStore migrations', () => {
     }
   });
 
-  it('a fresh observations FK uses ON UPDATE CASCADE and ON DELETE CASCADE', () => {
+  it('fresh observation and summary FKs use ON UPDATE CASCADE and ON DELETE CASCADE', () => {
     store = new SessionStore(':memory:');
-    const fks = store.db.query('PRAGMA foreign_key_list(observations)').all() as Array<{ table: string; on_update: string; on_delete: string }>;
-    const sessionFk = fks.find(fk => fk.table === 'sdk_sessions');
-    expect(sessionFk?.on_update).toBe('CASCADE');
-    expect(sessionFk?.on_delete).toBe('CASCADE');
+    for (const table of ['observations', 'session_summaries']) {
+      const fks = store.db.query(`PRAGMA foreign_key_list(${table})`).all() as Array<{ table: string; on_update: string; on_delete: string }>;
+      const sessionFk = fks.find(fk => fk.table === 'sdk_sessions');
+      expect(sessionFk?.on_update).toBe('CASCADE');
+      expect(sessionFk?.on_delete).toBe('CASCADE');
+    }
   });
 
   it('a fresh session_summaries FK uses ON UPDATE CASCADE and ON DELETE CASCADE', () => {

@@ -447,12 +447,12 @@ describe('default Anthropic-plan fallback: unusable replies', () => {
     expect(selectProviderForGenerator().provider).toBe('claude');
   });
 
-  it('still drops it when Claude cannot take the work', async () => {
+  it('preserves malformed work when Claude cannot take the work', async () => {
     pinGatewayPrimary();
     setClaudeFallbackReadinessForTesting(() => false);
     const { sm, confirmSpy } = await answerTwice(302);
-    expect(confirmSpy).toHaveBeenCalledWith(302);
-    expect(sm.getMessageBuffer().getPendingCount(302)).toBe(0);
+    expect(confirmSpy).not.toHaveBeenCalled();
+    expect(sm.getMessageBuffer().getPendingCount(302)).toBe(1);
     expect(getQuotaCooldown('openrouter')).toBeNull();
   });
 });

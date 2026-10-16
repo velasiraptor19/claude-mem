@@ -371,7 +371,14 @@ describe('an output failure consumes only its own batch; the work behind it is s
       sessionManager: unknown,
       protected readonly forwardEmptyMessageResponse: boolean,
     ) {
-      super({} as never, sessionManager as never);
+      super({
+        getSessionStore: () => ({
+          ensureMemorySessionIdRegistered: (_id: number, memoryId: string) => memoryId,
+          storeObservations: () => ({ observationIds: [], summaryId: null }),
+        }),
+        getChromaSync: () => null,
+        getCloudSync: () => null,
+      } as never, sessionManager as never);
     }
 
     protected getConfig() { return { apiKey: 'test-key', model: 'test/model' }; }
@@ -400,6 +407,7 @@ describe('an output failure consumes only its own batch; the work behind it is s
         confirmClaimedMessages,
         resetProcessingToPending: async () => {},
         getClaimedMessages: () => [],
+        handleMalformedOutput: async () => ({ retry: false, retryCount: 0 }),
       },
     };
   }
@@ -441,7 +449,7 @@ describe('an output failure consumes only its own batch; the work behind it is s
       // No separate init reply: by default the user prompt rides on the first
       // batch's request (CLAUDE_MEM_OBSERVE_BARE_PROMPTS).
       const observer = new ScriptedObserverProvider(
-        [outputFailure, 'NEXT_BATCH_REPLY'],
+        [outputFailure, '<skip_summary />'],
         manager,
         forwardEmptyMessageResponse,
       );
@@ -455,7 +463,7 @@ describe('an output failure consumes only its own batch; the work behind it is s
       expect(observer.sentHistories.filter(prompt => prompt.includes('FailedBatchTool'))).toHaveLength(1);
       expect(observer.sentHistories[1]).toContain('NextBatchTool');
       expect(session.abortReason ?? null).toBeNull();
-      expect(session.conversationHistory.some(turn => turn.role === 'assistant' && turn.content === 'NEXT_BATCH_REPLY')).toBe(true);
+      expect(session.conversationHistory.some(turn => turn.role === 'assistant' && turn.content === '<skip_summary />')).toBe(true);
     });
   }
 

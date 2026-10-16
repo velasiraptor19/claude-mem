@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, spyOn, mock } from 'bun:test';
 import { logger } from '../../src/utils/logger.js';
 import { SessionManager } from '../../src/services/worker/SessionManager.js';
 import type { DatabaseManager } from '../../src/services/worker/DatabaseManager.js';
@@ -84,5 +84,47 @@ describe('SessionManager with NULL user_prompt (worker-restart stale-session win
     const session = sm.initializeSession(1, 'fresh prompt', 2);
     expect(session.userPrompt).toBe('fresh prompt');
     expect(session.lastPromptNumber).toBe(2);
+  });
+
+  it('releases an exhausted batch when durable recovery enqueue fails, then quarantines it after one successful enqueue', async () => {
+    const sm = new SessionManager(makeDbManager('prompt'));
+    sm.initializeSession(1);
+    await sm.queueObservation(1, {
+      tool_name: 'Read', tool_input: {}, tool_response: {}, prompt_number: 1, toolUseId: 'tool-1',
+    });
+    const exhausted = mock()
+      .mockRejectedValueOnce(new Error('durable service unavailable'))
+      .mockResolvedValueOnce(undefined);
+    sm.setOnMalformedOutputExhausted(exhausted);
+
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const iterator = sm.getMessageIterator(1);
+      expect((await iterator.next()).done).toBe(false);
+      await expect(sm.handleMalformedOutput(1, {
+        outputClass: 'prose', preview: 'bad output', agentName: 'TestAgent',
+      })).resolves.toEqual({ retry: attempt <= 2, retryCount: attempt });
+      await iterator.return?.();
+    }
+
+    expect(exhausted).toHaveBeenCalledTimes(1);
+    expect(exhausted).toHaveBeenCalledWith(expect.objectContaining({
+      sessionDbId: 1,
+      retryCount: 3,
+      messages: [expect.objectContaining({ toolUseId: 'tool-1' })],
+    }));
+    // Failed durable enqueue must not strand the only recovery source in a
+    // recovery-pending in-memory state. The existing reset path reclaims it.
+    expect(await sm.resetProcessingToPending(1)).toBe(1);
+    const retryIterator = sm.getMessageIterator(1);
+    expect((await retryIterator.next()).done).toBe(false);
+    await expect(sm.handleMalformedOutput(1, {
+      outputClass: 'prose', preview: 'bad output', agentName: 'TestAgent',
+    })).resolves.toEqual({ retry: false, retryCount: 4 });
+    await retryIterator.return?.();
+
+    expect(exhausted).toHaveBeenCalledTimes(2);
+    expect(await sm.resetProcessingToPending(1)).toBe(0);
+    expect(sm.getTotalQueueDepth()).toBe(0);
+    expect(sm.getMessageBuffer().getMessagesByIds(1, [1])).toHaveLength(1);
   });
 });

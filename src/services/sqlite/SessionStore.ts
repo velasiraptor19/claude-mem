@@ -14,7 +14,10 @@ import {
   SessionSummaryRecord,
   UserPromptRecord,
   AdvisorCallRecord,
-  LatestPromptResult
+  LatestPromptResult,
+  RecoveryJobRecord,
+  EnqueueRecoveryJobInput,
+  AUTO_REVIVABLE_RECOVERY_CANCELLATION_REASONS,
 } from '../../types/database.js';
 import type { ObservationSearchResult, SessionSummarySearchResult } from './types.js';
 import { computeObservationContentHash, hasStorableTitle } from './observations/store.js';
@@ -114,6 +117,8 @@ interface IndexColumnInfo {
   name: string;
 }
 
+const REVIVABLE_CANCELLED_RECOVERY_JOB_SQL = `(cancellation_reason IS NULL OR cancellation_reason IN (${AUTO_REVIVABLE_RECOVERY_CANCELLATION_REASONS.map(reason => `'${reason}'`).join(', ')}))`;
+
 interface RecentSessionStatusRow {
   memory_session_id: string | null;
   status: string;
@@ -192,6 +197,7 @@ interface SdkSessionDetailRow {
   status: string;
   observed_model: string | null;
   observed_billing: string | null;
+  transcript_locator: string | null;
 }
 
 export interface SessionCatalogRow {
@@ -312,6 +318,10 @@ export class SessionStore {
     this.ensureProjectRecencyIndexes();
     this.ensureMergedIntoProjectCoveringIndexes();
     this.ensureNativePromptIdentity();
+    this.createRecoveryJobsTable();
+    this.ensureRecoveryLineageSchema();
+    this.ensureHistoricalSummaryRepresentations();
+    this.ensureRecoveryCancellationProvenance();
   }
 
   /** Local host retry identity. Runs after every legacy user_prompts rebuild. */
@@ -345,6 +355,134 @@ export class SessionStore {
           .run(65, new Date().toISOString());
       } finally { rows.finalize(); update.finalize(); }
     }).immediate();
+  }
+
+  /**
+   * Recovery schema records intentional recovery cancellation without rewriting legacy
+   * rows. A NULL reason therefore remains an eligible historical-recovery
+   * candidate, while an explicit API cancellation remains durable.
+   */
+  private ensureRecoveryCancellationProvenance(): void {
+    // This migration can run while a freshly-updated worker and a hook both
+    // open the same legacy database. Take the SQLite write reservation before
+    // inspecting either invariant, then make both the column and version
+    // writes idempotent inside one atomic migration boundary.
+    this.db.run('BEGIN IMMEDIATE');
+    try {
+      const columns = this.db.query('PRAGMA table_info(recovery_jobs)').all() as TableColumnInfo[];
+      if (!columns.some(item => item.name === 'cancellation_reason')) {
+        this.db.run('ALTER TABLE recovery_jobs ADD COLUMN cancellation_reason TEXT');
+      }
+      this.db.run('COMMIT');
+    } catch (error) {
+      try {
+        this.db.run('ROLLBACK');
+      } catch {
+        // BEGIN IMMEDIATE can fail before a transaction exists; preserve the
+        // original migration error rather than replacing it with rollback noise.
+      }
+      throw error;
+    }
+  }
+
+  private ensureHistoricalSummaryRepresentations(): void {
+    const migrate = this.db.transaction(() => {
+      this.db.run(`CREATE TABLE IF NOT EXISTS historical_summary_representations (
+        source_fingerprint TEXT PRIMARY KEY,
+        summary_id INTEGER NOT NULL REFERENCES session_summaries(id) ON DELETE CASCADE,
+        representation_kind TEXT NOT NULL CHECK(representation_kind IN ('original','backfill_part','backfill_merged')),
+        content_session_id TEXT NOT NULL,
+        prompt_number INTEGER NOT NULL,
+        created_at_epoch INTEGER NOT NULL
+      )`);
+      this.db.run('CREATE INDEX IF NOT EXISTS idx_historical_representations_turn ON historical_summary_representations(content_session_id, prompt_number)');
+    });
+    migrate.immediate();
+  }
+
+  // Maintained v50–53 collided with upstream. Inspect recovery invariants; never
+  // gate on or claim those upstream version numbers, including on legacy stores.
+  private ensureRecoveryLineageSchema(): void {
+    // Legacy maintained v51 replaced the per-session active-job UNIQUE index with a non-unique
+    // lookup index because historical recovery queues one job per turn. Some
+    // interrupted installs retained the old index but still recorded v51, so
+    // enforce the index invariant on every open.
+    this.db.run(`
+      DROP INDEX IF EXISTS ux_recovery_jobs_active_session_kind;
+      CREATE INDEX IF NOT EXISTS idx_recovery_jobs_active_session_kind
+        ON recovery_jobs(content_session_id, recovery_kind, status);
+    `);
+    const add = (table: string, column: string, sqlType: string) => {
+      const columns = this.db.query(`PRAGMA table_info(${table})`).all() as TableColumnInfo[];
+      if (!columns.some(item => item.name === column)) this.db.run(`ALTER TABLE ${table} ADD COLUMN ${column} ${sqlType}`);
+    };
+    const sessionColumns: Array<[string, string]> = [
+      ['parent_content_session_id', 'TEXT'], ['root_content_session_id', 'TEXT'],
+      ['agent_id', 'TEXT'], ['agent_type', 'TEXT'], ['agent_path', 'TEXT'],
+      ['agent_nickname', 'TEXT'], ['agent_depth', 'INTEGER'], ['transcript_locator', 'TEXT'],
+    ];
+    const migrate = this.db.transaction(() => {
+    for (const [name, type] of sessionColumns) add('sdk_sessions', name, type);
+    const jobColumns: Array<[string, string]> = [
+      ['recovery_key', 'TEXT'], ['source_fingerprint', 'TEXT'], ['prompt_number', 'INTEGER'],
+      ['turn_id', 'TEXT'], ['parent_content_session_id', 'TEXT'], ['root_content_session_id', 'TEXT'],
+      ['agent_id', 'TEXT'], ['transcript_sha256', 'TEXT'], ['dead_letter_reason', 'TEXT'],
+    ];
+    for (const [name, type] of jobColumns) add('recovery_jobs', name, type);
+    add('session_summaries', 'source_fingerprint', 'TEXT');
+    this.db.run(`
+      UPDATE recovery_jobs SET recovery_key = 'legacy:' || id WHERE recovery_key IS NULL;
+      DROP INDEX IF EXISTS ux_recovery_jobs_active_session_kind;
+      CREATE UNIQUE INDEX IF NOT EXISTS ux_recovery_jobs_key ON recovery_jobs(recovery_key);
+      CREATE INDEX IF NOT EXISTS idx_recovery_jobs_active_session_kind
+        ON recovery_jobs(content_session_id, recovery_kind, status);
+      CREATE UNIQUE INDEX IF NOT EXISTS ux_session_summaries_source_fingerprint
+        ON session_summaries(source_fingerprint) WHERE source_fingerprint IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_sdk_sessions_parent ON sdk_sessions(parent_content_session_id);
+      CREATE INDEX IF NOT EXISTS idx_sdk_sessions_root ON sdk_sessions(root_content_session_id);
+    `);
+    });
+    migrate.immediate();
+  }
+
+  private createRecoveryJobsTable(): void {
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS recovery_jobs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        content_session_id TEXT NOT NULL,
+        recovery_kind TEXT NOT NULL,
+        project TEXT NOT NULL,
+        platform_source TEXT NOT NULL,
+        transcript_locator TEXT,
+        reason TEXT NOT NULL,
+        first_failure_at_epoch INTEGER NOT NULL,
+        last_failure_at_epoch INTEGER NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+        next_attempt_at_epoch INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending'
+          CHECK(status IN ('pending', 'running', 'retry_wait', 'completed', 'dead_letter', 'cancelled')),
+        provider TEXT,
+        model TEXT,
+        last_sanitized_error TEXT,
+        lease_owner TEXT,
+        lease_expires_at_epoch INTEGER,
+        created_at_epoch INTEGER NOT NULL,
+        updated_at_epoch INTEGER NOT NULL,
+        completed_at_epoch INTEGER,
+        cancellation_reason TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_recovery_jobs_active_session_kind
+      ON recovery_jobs(content_session_id, recovery_kind)
+      WHERE status IN ('pending', 'running', 'retry_wait');
+
+      CREATE INDEX IF NOT EXISTS idx_recovery_jobs_claim
+      ON recovery_jobs(status, next_attempt_at_epoch, created_at_epoch, id);
+
+      CREATE INDEX IF NOT EXISTS idx_recovery_jobs_lease
+      ON recovery_jobs(status, lease_expires_at_epoch)
+      WHERE status = 'running';
+    `);
   }
 
   private getIndexColumns(indexName: string): string[] {
@@ -2603,6 +2741,280 @@ export class SessionStore {
     this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(30, new Date().toISOString());
   }
 
+  enqueueRecoveryJob(input: EnqueueRecoveryJobInput): RecoveryJobRecord {
+    const now = input.nowEpoch ?? Date.now();
+    const nextAttempt = input.nextAttemptAtEpoch ?? now;
+    const normalizedPlatform = normalizePlatformSource(input.platformSource);
+    const recoveryKey = input.recoveryKey ?? createHash('sha256')
+      .update([normalizedPlatform, input.contentSessionId, input.recoveryKind, now].join(':')).digest('hex');
+
+    const tx = this.db.transaction(() => {
+      let active = !input.recoveryKey ? this.db.prepare(`
+        SELECT id FROM recovery_jobs WHERE content_session_id=? AND recovery_kind=?
+          AND status IN ('pending','running','retry_wait') LIMIT 1
+      `).get(input.contentSessionId, input.recoveryKind) as { id: number } | undefined : undefined;
+      if (!active) this.db.prepare(`
+        INSERT OR IGNORE INTO recovery_jobs (
+          content_session_id, recovery_kind, project, platform_source,
+          transcript_locator, reason, first_failure_at_epoch,
+          last_failure_at_epoch, next_attempt_at_epoch, provider, model,
+          last_sanitized_error, created_at_epoch, updated_at_epoch, recovery_key,
+          source_fingerprint, prompt_number, turn_id, parent_content_session_id,
+          root_content_session_id, agent_id, transcript_sha256
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        input.contentSessionId, input.recoveryKind, input.project,
+        normalizedPlatform, input.transcriptLocator ?? null, input.reason,
+        now, now, nextAttempt, input.provider ?? null, input.model ?? null,
+        input.sanitizedError ?? null, now, now, recoveryKey,
+        input.sourceFingerprint ?? null, input.promptNumber ?? null, input.turnId ?? null,
+        input.parentContentSessionId ?? null, input.rootContentSessionId ?? null,
+        input.agentId ?? null, input.transcriptSha256 ?? null
+      );
+
+      active = active ?? (input.recoveryKey ? this.db.prepare(`
+        SELECT id FROM recovery_jobs WHERE recovery_key = ? LIMIT 1
+      `).get(recoveryKey) as { id: number } | undefined : this.db.prepare(`
+        SELECT id FROM recovery_jobs WHERE content_session_id=? AND recovery_kind=?
+          AND status IN ('pending','running','retry_wait') LIMIT 1
+      `).get(input.contentSessionId, input.recoveryKind) as { id: number } | undefined);
+      if (!active) throw new Error('Failed to enqueue or locate active recovery job');
+
+      this.db.prepare(`
+        UPDATE recovery_jobs
+        SET status = CASE WHEN status = 'cancelled' AND ${REVIVABLE_CANCELLED_RECOVERY_JOB_SQL} THEN 'pending' ELSE status END,
+            attempts = CASE WHEN status = 'cancelled' AND ${REVIVABLE_CANCELLED_RECOVERY_JOB_SQL} THEN 0 ELSE attempts END,
+            completed_at_epoch = CASE WHEN status = 'cancelled' AND ${REVIVABLE_CANCELLED_RECOVERY_JOB_SQL} THEN NULL ELSE completed_at_epoch END,
+            dead_letter_reason = CASE WHEN status = 'cancelled' AND ${REVIVABLE_CANCELLED_RECOVERY_JOB_SQL} THEN NULL ELSE dead_letter_reason END,
+            lease_owner = CASE WHEN status = 'cancelled' AND ${REVIVABLE_CANCELLED_RECOVERY_JOB_SQL} THEN NULL ELSE lease_owner END,
+            lease_expires_at_epoch = CASE WHEN status = 'cancelled' AND ${REVIVABLE_CANCELLED_RECOVERY_JOB_SQL} THEN NULL ELSE lease_expires_at_epoch END,
+            cancellation_reason = CASE WHEN status = 'cancelled' AND ${REVIVABLE_CANCELLED_RECOVERY_JOB_SQL} THEN NULL ELSE cancellation_reason END,
+            project = ?, platform_source = ?,
+            transcript_locator = COALESCE(?, transcript_locator),
+            reason = ?, last_failure_at_epoch = ?,
+            next_attempt_at_epoch = CASE WHEN status = 'cancelled' AND ${REVIVABLE_CANCELLED_RECOVERY_JOB_SQL} THEN ? ELSE MIN(next_attempt_at_epoch, ?) END,
+            provider = COALESCE(?, provider), model = COALESCE(?, model),
+            last_sanitized_error = COALESCE(?, last_sanitized_error),
+            source_fingerprint = COALESCE(?, source_fingerprint),
+            transcript_sha256 = COALESCE(?, transcript_sha256),
+            updated_at_epoch = ?
+        WHERE id = ?
+      `).run(
+        input.project, normalizedPlatform, input.transcriptLocator ?? null,
+        input.reason, now, nextAttempt, nextAttempt, input.provider ?? null,
+        input.model ?? null, input.sanitizedError ?? null,
+        input.sourceFingerprint ?? null, input.transcriptSha256 ?? null, now, active.id
+      );
+      return this.getRecoveryJob(active.id)!;
+    });
+
+    return tx();
+  }
+
+  getRecoveryJob(id: number): RecoveryJobRecord | null {
+    return (this.db.prepare('SELECT * FROM recovery_jobs WHERE id = ?').get(id) as RecoveryJobRecord | undefined) ?? null;
+  }
+
+  getRecoveryJobByKey(recoveryKey: string): RecoveryJobRecord | null {
+    return (this.db.prepare('SELECT * FROM recovery_jobs WHERE recovery_key=?').get(recoveryKey) as RecoveryJobRecord | undefined) ?? null;
+  }
+
+  getRecoveryJobCounts(): Record<string, number> {
+    const rows = this.db.prepare('SELECT status, COUNT(*) count FROM recovery_jobs GROUP BY status').all() as Array<{ status: string; count: number }>;
+    return Object.fromEntries(rows.map(row => [row.status, row.count]));
+  }
+
+  releaseExpiredRecoveryLeases(nowEpoch: number = Date.now()): number {
+    const result = this.db.prepare(`
+      UPDATE recovery_jobs
+      SET status = 'retry_wait', lease_owner = NULL, lease_expires_at_epoch = NULL,
+          next_attempt_at_epoch = MIN(next_attempt_at_epoch, ?), updated_at_epoch = ?
+      WHERE status = 'running' AND lease_expires_at_epoch IS NOT NULL
+        AND lease_expires_at_epoch <= ?
+    `).run(nowEpoch, nowEpoch, nowEpoch);
+    return result.changes;
+  }
+
+  claimOldestRecoveryJob(leaseOwner: string, leaseDurationMs: number, nowEpoch: number = Date.now()): RecoveryJobRecord | null {
+    if (!leaseOwner.trim()) throw new Error('Recovery lease owner is required');
+    if (!Number.isSafeInteger(leaseDurationMs) || leaseDurationMs <= 0) {
+      throw new Error('Recovery lease duration must be a positive integer');
+    }
+
+    const tx = this.db.transaction(() => {
+      this.releaseExpiredRecoveryLeases(nowEpoch);
+      const candidate = this.db.prepare(`
+        SELECT id FROM recovery_jobs
+        WHERE status IN ('pending', 'retry_wait') AND next_attempt_at_epoch <= ?
+        ORDER BY created_at_epoch ASC, id ASC
+        LIMIT 1
+      `).get(nowEpoch) as { id: number } | undefined;
+      if (!candidate) return null;
+
+      const leaseExpiresAt = nowEpoch + leaseDurationMs;
+      const claimed = this.db.prepare(`
+        UPDATE recovery_jobs
+        SET status = 'running', attempts = attempts + 1,
+            lease_owner = ?, lease_expires_at_epoch = ?, updated_at_epoch = ?
+        WHERE id = ? AND status IN ('pending', 'retry_wait')
+      `).run(leaseOwner, leaseExpiresAt, nowEpoch, candidate.id);
+      return claimed.changes === 1 ? this.getRecoveryJob(candidate.id) : null;
+    });
+    return tx();
+  }
+
+  claimRecoveryJobByKey(recoveryKey: string, leaseOwner: string, leaseDurationMs: number, nowEpoch: number = Date.now()): RecoveryJobRecord | null {
+    if (!/^[a-f0-9]{64}$/i.test(recoveryKey)) throw new Error('Recovery key must be a SHA-256 digest');
+    if (!leaseOwner.trim()) throw new Error('Recovery lease owner is required');
+    if (!Number.isSafeInteger(leaseDurationMs) || leaseDurationMs <= 0) throw new Error('Recovery lease duration must be a positive integer');
+    const tx = this.db.transaction(() => {
+      this.releaseExpiredRecoveryLeases(nowEpoch);
+      const candidate = this.db.prepare(`
+        SELECT id FROM recovery_jobs
+        WHERE recovery_key=? AND status IN ('pending', 'retry_wait') AND next_attempt_at_epoch <= ?
+        LIMIT 1
+      `).get(recoveryKey, nowEpoch) as { id: number } | undefined;
+      if (!candidate) return null;
+      const claimed = this.db.prepare(`
+        UPDATE recovery_jobs SET status='running', attempts=attempts+1,
+          lease_owner=?, lease_expires_at_epoch=?, updated_at_epoch=?
+        WHERE id=? AND recovery_key=? AND status IN ('pending', 'retry_wait')
+      `).run(leaseOwner, nowEpoch + leaseDurationMs, nowEpoch, candidate.id, recoveryKey);
+      return claimed.changes === 1 ? this.getRecoveryJob(candidate.id) : null;
+    });
+    return tx();
+  }
+
+  markRecoveryJobRetryWait(id: number, leaseOwner: string, nextAttemptAtEpoch: number, sanitizedError: string, nowEpoch: number = Date.now()): boolean {
+    const result = this.db.prepare(`
+      UPDATE recovery_jobs
+      SET status = 'retry_wait', last_failure_at_epoch = ?, next_attempt_at_epoch = ?,
+          last_sanitized_error = ?, lease_owner = NULL, lease_expires_at_epoch = NULL,
+          updated_at_epoch = ?
+      WHERE id = ? AND status = 'running' AND lease_owner = ?
+    `).run(nowEpoch, nextAttemptAtEpoch, sanitizedError, nowEpoch, id, leaseOwner);
+    return result.changes === 1;
+  }
+
+  markRecoveryJobCompleted(id: number, leaseOwner: string, nowEpoch: number = Date.now()): boolean {
+    const result = this.db.prepare(`
+      UPDATE recovery_jobs
+      SET status = 'completed', completed_at_epoch = ?, lease_owner = NULL,
+          lease_expires_at_epoch = NULL, updated_at_epoch = ?
+      WHERE id = ? AND status = 'running' AND lease_owner = ?
+    `).run(nowEpoch, nowEpoch, id, leaseOwner);
+    return result.changes === 1;
+  }
+
+  renewRecoveryJobLease(id: number, leaseOwner: string, leaseDurationMs: number, nowEpoch: number = Date.now()): boolean {
+    const result = this.db.prepare(`
+      UPDATE recovery_jobs SET lease_expires_at_epoch=?, updated_at_epoch=?
+      WHERE id=? AND status='running' AND lease_owner=?
+    `).run(nowEpoch + leaseDurationMs, nowEpoch, id, leaseOwner);
+    return result.changes === 1;
+  }
+
+  markRecoveryJobDeadLetter(id: number, sanitizedError: string, nowEpoch: number = Date.now(), leaseOwner?: string): boolean {
+    const ownership = leaseOwner === undefined
+      ? "status IN ('pending', 'retry_wait')"
+      : "status = 'running' AND lease_owner = ?";
+    const result = this.db.prepare(`
+      UPDATE recovery_jobs
+      SET status = 'dead_letter', last_failure_at_epoch = ?, last_sanitized_error = ?, dead_letter_reason = ?,
+          completed_at_epoch = ?, lease_owner = NULL, lease_expires_at_epoch = NULL,
+          updated_at_epoch = ?
+      WHERE id = ? AND ${ownership}
+    `).run(nowEpoch, sanitizedError, sanitizedError, nowEpoch, nowEpoch, id, ...(leaseOwner === undefined ? [] : [leaseOwner]));
+    return result.changes === 1;
+  }
+
+  upsertSessionLineage(contentSessionId: string, project: string, platformSource: string, lineage: import('../../types/database.js').SessionLineageInput, startedAtEpoch = Date.now()): { id: number; memory_session_id: string } {
+    const memoryId = `recovered:${normalizePlatformSource(platformSource)}:${contentSessionId}`;
+    this.db.prepare(`
+      INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, platform_source, user_prompt,
+        started_at, started_at_epoch, status, parent_content_session_id, root_content_session_id,
+        agent_id, agent_type, agent_path, agent_nickname, agent_depth, transcript_locator)
+      VALUES (?, ?, ?, ?, '', ?, ?, 'completed', ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(platform_source, content_session_id) DO NOTHING
+    `).run(contentSessionId, memoryId, project, normalizePlatformSource(platformSource), new Date(startedAtEpoch).toISOString(), startedAtEpoch,
+      lineage.parentContentSessionId ?? null, lineage.rootContentSessionId ?? contentSessionId,
+      lineage.agentId ?? null, lineage.agentType ?? null, lineage.agentPath ?? null,
+      lineage.agentNickname ?? null, lineage.agentDepth ?? 0, lineage.transcriptLocator ?? null);
+    // Existing lineage is authoritative. Recovery may fill absent metadata but
+    // must never relabel a healthy session from a stale job/transcript.
+    this.db.prepare(`UPDATE sdk_sessions SET
+      parent_content_session_id=COALESCE(parent_content_session_id, ?),
+      root_content_session_id=COALESCE(root_content_session_id, ?), agent_id=COALESCE(agent_id, ?),
+      agent_type=COALESCE(agent_type, ?), agent_path=COALESCE(agent_path, ?),
+      agent_nickname=COALESCE(agent_nickname, ?), agent_depth=COALESCE(agent_depth, ?),
+      transcript_locator=COALESCE(transcript_locator, ?)
+      WHERE platform_source=? AND content_session_id=?`).run(
+        lineage.parentContentSessionId ?? null, lineage.rootContentSessionId ?? null,
+        lineage.agentId ?? null, lineage.agentType ?? null, lineage.agentPath ?? null,
+        lineage.agentNickname ?? null, lineage.agentDepth ?? null, lineage.transcriptLocator ?? null,
+        normalizePlatformSource(platformSource), contentSessionId);
+    return this.db.prepare('SELECT id, memory_session_id FROM sdk_sessions WHERE platform_source=? AND content_session_id=?')
+      .get(normalizePlatformSource(platformSource), contentSessionId) as { id: number; memory_session_id: string };
+  }
+
+  hasSummaryFingerprint(fingerprint: string): boolean {
+    return !!this.db.prepare('SELECT 1 FROM session_summaries WHERE source_fingerprint=? LIMIT 1').get(fingerprint);
+  }
+
+  getRecoverySummaryByFingerprint(fingerprint: string): ({ id: number; memory_session_id: string; project: string; request: string; investigated: string; learned: string; completed: string; next_steps: string; notes: string | null; prompt_number: number | null; created_at_epoch: number }) | null {
+    return (this.db.prepare(`SELECT id, memory_session_id, project, request, investigated, learned, completed, next_steps, notes, prompt_number, created_at_epoch
+      FROM session_summaries WHERE source_fingerprint=? LIMIT 1`).get(fingerprint) as any) ?? null;
+  }
+
+  storeRecoverySummary(memorySessionId: string, project: string, summary: { request: string; investigated: string; learned: string; completed: string; next_steps: string; notes: string | null }, fingerprint: string, promptNumber: number | null, timestampEpoch: number): { id: number; createdAtEpoch: number; inserted: boolean } {
+    const result = this.db.prepare(`INSERT INTO session_summaries
+      (memory_session_id, project, request, investigated, learned, completed, next_steps, notes,
+       prompt_number, discovery_tokens, created_at, created_at_epoch, source_fingerprint)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+      ON CONFLICT DO NOTHING RETURNING id`)
+      .get(memorySessionId, project, summary.request, summary.investigated, summary.learned,
+        summary.completed, summary.next_steps, summary.notes, promptNumber,
+        new Date(timestampEpoch).toISOString(), timestampEpoch, fingerprint) as { id: number } | null;
+    if (result) return { id: result.id, createdAtEpoch: timestampEpoch, inserted: true };
+    const existing = this.db.prepare('SELECT id, created_at_epoch FROM session_summaries WHERE source_fingerprint=?').get(fingerprint) as { id: number; created_at_epoch: number };
+    return { id: existing.id, createdAtEpoch: existing.created_at_epoch, inserted: false };
+  }
+
+  cancelRecoveryJob(id: number, nowEpoch: number = Date.now(), cancellationReason: 'manual' | 'historical_scan' = 'manual'): boolean {
+    const result = this.db.prepare(`
+      UPDATE recovery_jobs
+      SET status = 'cancelled', completed_at_epoch = ?, lease_owner = NULL,
+          lease_expires_at_epoch = NULL, cancellation_reason = ?, updated_at_epoch = ?
+      WHERE id = ? AND status IN ('pending', 'retry_wait')
+    `).run(nowEpoch, cancellationReason, nowEpoch, id);
+    return result.changes === 1;
+  }
+
+  resumeDeadLetterRecoveryJob(id: number, nowEpoch: number = Date.now()): boolean {
+    const result = this.db.prepare(`
+      UPDATE recovery_jobs
+      SET status = 'pending', next_attempt_at_epoch = ?, completed_at_epoch = NULL,
+          dead_letter_reason = NULL, lease_owner = NULL, lease_expires_at_epoch = NULL,
+          updated_at_epoch = ?
+      WHERE id = ? AND status = 'dead_letter'
+        AND transcript_locator IS NOT NULL AND source_fingerprint IS NOT NULL
+        AND prompt_number IS NOT NULL AND turn_id IS NOT NULL
+    `).run(nowEpoch, nowEpoch, id);
+    return result.changes === 1;
+  }
+
+  cancelSupersededTurnMismatchJobs(platformSource: string, contentSessionId: string, promptNumber: number, turnId: string, currentFingerprint: string, nowEpoch: number = Date.now()): number {
+    const result = this.db.prepare(`
+      UPDATE recovery_jobs
+      SET status = 'cancelled', completed_at_epoch = ?, lease_owner = NULL,
+          lease_expires_at_epoch = NULL, cancellation_reason = 'superseded_turn_mismatch', updated_at_epoch = ?
+      WHERE platform_source = ? AND content_session_id = ?
+        AND prompt_number = ? AND turn_id = ? AND source_fingerprint <> ?
+        AND status = 'dead_letter' AND dead_letter_reason LIKE 'turn_mismatch:%'
+    `).run(nowEpoch, nowEpoch, normalizePlatformSource(platformSource), contentSessionId, promptNumber, turnId, currentFingerprint);
+    return result.changes;
+  }
+
   updateMemorySessionId(sessionDbId: number, memorySessionId: string | null): void {
     const current = this.db.prepare(`
       SELECT memory_session_id
@@ -2613,11 +3025,16 @@ export class SessionStore {
     if (!current || current.memory_session_id === memorySessionId) return;
 
     this.db.transaction(() => {
+      this.db.run('PRAGMA defer_foreign_keys = ON');
       this.db.prepare(`
         UPDATE sdk_sessions
         SET memory_session_id = ?
         WHERE id = ?
       `).run(memorySessionId, sessionDbId);
+      if (current.memory_session_id && memorySessionId) {
+        this.db.prepare('UPDATE session_summaries SET memory_session_id = ? WHERE memory_session_id = ?')
+          .run(memorySessionId, current.memory_session_id);
+      }
       // Observations cascade this deliberate identity change through their FK;
       // receipts have no FK, so carry the same session identity explicitly.
       this.db.prepare(`
@@ -3294,7 +3711,7 @@ export class SessionStore {
       SELECT id, content_session_id, memory_session_id, project,
              COALESCE(platform_source, '${DEFAULT_PLATFORM_SOURCE}') as platform_source,
              user_prompt, custom_title, status,
-             observed_model, observed_billing
+             observed_model, observed_billing, transcript_locator
       FROM sdk_sessions
       WHERE id = ?
       LIMIT 1

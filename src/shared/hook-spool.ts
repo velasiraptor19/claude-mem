@@ -45,6 +45,9 @@ export interface SpooledObservationPayload {
 }
 
 export interface SpooledSummarizePayload {
+  agentId?: string;
+  transcriptPath?: string;
+  agentType?: string;
   contentSessionId: string;
   platformSource: string;
   lastAssistantMessage: string;

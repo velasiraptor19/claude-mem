@@ -847,6 +847,12 @@ export class ClaudeProvider {
                 subtype: resultSubtype,
               });
               await this.sessionManager.resetProcessingToPending(session.sessionDbId);
+            } else if (resultIsError) {
+              // A second failed transport result never answered the batch.
+              await this.sessionManager.resetProcessingToPending(session.sessionDbId);
+              session.abortReason = 'transport:failed_result';
+              session.abortController.abort();
+              break;
             } else {
               pacer.processingStarted();
               try {

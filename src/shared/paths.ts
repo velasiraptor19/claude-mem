@@ -1,4 +1,4 @@
-import { join, dirname, basename, sep } from 'path';
+import { join, dirname, basename, resolve, sep } from 'path';
 import { homedir } from 'os';
 import { existsSync, mkdirSync, readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
@@ -104,8 +104,59 @@ export function ensureObserverSessionsDir(
   return dir;
 }
 
-export function getPackageRoot(): string {
-  return join(_dirname, '..');
+export interface PackageRootResolutionOptions {
+  entryScript?: string;
+  moduleDir?: string;
+  cwd?: string;
+}
+
+function isRuntimePackageRoot(candidate: string): boolean {
+  const scriptsDir = join(candidate, 'scripts');
+  const hasRuntimeEntry = existsSync(join(scriptsDir, 'worker-service.cjs'))
+    || existsSync(join(scriptsDir, 'server-service.cjs'));
+  const hasRuntimeAssets = existsSync(join(candidate, 'ui'))
+    || existsSync(join(candidate, 'skills'));
+
+  // Marketplace plugin payloads are executable distributions but are not
+  // guaranteed to carry package.json. Requiring npm metadata made a worker
+  // launched from <marketplace>/plugin/scripts fall through to the bundled
+  // source-tree __dirname, breaking GUI assets and lazy worker startup.
+  // Concrete runtime entries plus packaged assets are stricter and work for
+  // Claude/Codex caches, marketplace payloads, npm, and source installs.
+  return existsSync(scriptsDir) && hasRuntimeEntry && hasRuntimeAssets;
+}
+
+function findRuntimePackageRoot(start: string): string | null {
+  let current = resolve(start);
+  for (;;) {
+    if (isRuntimePackageRoot(current)) return current;
+    const parent = dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+}
+
+/**
+ * Resolve the runtime package root from the script that Node/Bun actually
+ * launched. Bundlers may bake the source-tree `__dirname` into a generated
+ * worker, so moduleDir is only a fallback. Structural markers make this work
+ * for Claude and Codex caches as well as npm and source-tree installations
+ * without encoding any host-specific cache path.
+ */
+export function getPackageRoot(options: PackageRootResolutionOptions = {}): string {
+  const entryScript = options.entryScript ?? process.argv[1];
+  const starts = [
+    entryScript ? dirname(resolve(entryScript)) : null,
+    options.moduleDir ?? _dirname,
+    options.cwd ?? process.cwd(),
+  ];
+  for (const start of starts) {
+    if (!start) continue;
+    const root = findRuntimePackageRoot(start);
+    if (root) return root;
+  }
+
+  return join(options.moduleDir ?? _dirname, '..');
 }
 
 /**

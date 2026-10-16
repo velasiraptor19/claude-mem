@@ -415,18 +415,21 @@ export async function adoptMergedWorktrees(opts: {
   dataDirectory?: string;
   dryRun?: boolean;
   onlyBranch?: string;
+  chromaSync?: Pick<ChromaSync, 'updateMergedIntoProject'>;
+  projectContext?: typeof getProjectContext;
 } = {}): Promise<AdoptionResult> {
   const dataDirectory = opts.dataDirectory ?? DEFAULT_DATA_DIR;
   const dryRun = opts.dryRun ?? false;
   const startCwd = opts.repoPath ?? process.cwd();
 
   const mainRepo = await resolveMainRepoPath(startCwd);
+  const projectContext = opts.projectContext ?? getPathModeProjectContext;
   // Worktree and submodule composites (`<repo>/<worktree>`) are folder-based
   // keys, so the sweep works on the repository's folder-based key whatever
   // names the repository now: with a git-remote slug (#2827), rows a worktree
   // wrote before the switch are still folded when it merges or is deleted, into
   // a key the repository keeps reading.
-  const parentProject = mainRepo ? getPathModeProjectContext(mainRepo).primary : '';
+  const parentProject = mainRepo ? projectContext(mainRepo).primary : '';
   const currentProject = mainRepo ? getProjectContext(mainRepo).primary : '';
 
   const result: AdoptionResult = {
@@ -570,7 +573,7 @@ export async function adoptMergedWorktrees(opts: {
     const liveWorktreeProjects = new Set([
       currentProject,
       ...liveCheckouts.flatMap(checkout => [
-        getPathModeProjectContext(checkout).primary,
+        projectContext(checkout).primary,
         getProjectContext(checkout).primary,
       ]),
     ]);
@@ -584,7 +587,7 @@ export async function adoptMergedWorktrees(opts: {
       : listOrphanProjectKeys(db, parentProject, liveWorktreeProjects, false, writerEvidence);
 
     const adoptionTargets: Array<{ project: string; label: string }> = [
-      ...targets.map(wt => ({ project: getPathModeProjectContext(wt.path).primary, label: wt.path })),
+      ...targets.map(wt => ({ project: projectContext(wt.path).primary, label: wt.path })),
       ...orphanProjects.map(project => ({ project, label: `${project} (worktree removed)` })),
     ]
       // A worktree named after its repo writes to the repo key itself (#3641);
@@ -632,7 +635,7 @@ export async function adoptMergedWorktrees(opts: {
     adoptedChromaTargets.length > 0 &&
     SettingsDefaultsManager.loadFromFile(path.join(dataDirectory, 'settings.json')).CLAUDE_MEM_CHROMA_ENABLED !== 'false'
   ) {
-    const chromaSync = new ChromaSync('claude-mem');
+    const chromaSync = opts.chromaSync ?? new ChromaSync('claude-mem');
     try {
       await chromaSync.updateMergedIntoProject(adoptedChromaTargets, parentProject);
       result.chromaUpdates = adoptedChromaTargets.length;

@@ -458,12 +458,20 @@ describe('processesStillUsingArm', () => {
       const listener = net.createServer();
       await new Promise<void>(resolve => listener.listen(0, '127.0.0.1', resolve));
       const port = (listener.address() as net.AddressInfo).port;
-      const child = Bun.spawn([process.execPath, '-e', 'setTimeout(() => {}, 30000)', dataDirectory], { stdout: 'ignore', stderr: 'ignore' });
+      const child = Bun.spawn([process.execPath, '-e', 'console.log("ready"); setTimeout(() => {}, 30000)', dataDirectory], { stdout: 'pipe', stderr: 'ignore' });
       try {
+        // Wait for exec/initialization before asking pgrep to inspect the child argv.
+        const ready = await child.stdout.getReader().read();
+        expect(new TextDecoder().decode(ready.value)).toBe('ready\n');
         // lsof finds this test process on the port, which is dropped like the runner itself.
-        expect(processesStillUsingArm({ name: 'on', dataDirectory, port })).toEqual([child.pid]);
+        // pgrep's regex matcher needs a UTF-8 locale for this Unicode fixture.
+        const query = (command: string, args: string[]) => spawnSync(command, args, {
+          encoding: 'utf8', env: { ...process.env, LC_ALL: 'C.UTF-8' },
+        });
+        expect(processesStillUsingArm({ name: 'on', dataDirectory, port }, query)).toEqual([child.pid]);
       } finally {
         child.kill();
+        await child.exited;
         listener.close();
       }
     },

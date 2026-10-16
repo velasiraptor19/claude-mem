@@ -534,7 +534,8 @@ describe('Plugin Distribution - package.json Files Field', () => {
     });
 
     expect(result.status).toBe(0);
-    const packed = JSON.parse(result.stdout);
+    const parsed = JSON.parse(result.stdout);
+    const packed = Array.isArray(parsed) ? parsed : (parsed.files ? [parsed] : Object.values(parsed));
     const filePaths = new Set(packed[0].files.map((file: { path: string }) => file.path));
 
     expect(filePaths.has('dist/bug-report/index.js')).toBe(true);

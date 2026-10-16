@@ -33,7 +33,7 @@ import { buildWorkStateContextSection } from '../../../context/sections/WorkStat
 import { isWorkStateEnabled } from '../../../../shared/work-state-setting.js';
 import { SettingsDefaultsManager } from '../../../../shared/SettingsDefaultsManager.js';
 import { getViewerBaseUrl } from '../../../../shared/worker-utils.js';
-import { USER_SETTINGS_PATH } from '../../../../shared/paths.js';
+import { USER_SETTINGS_PATH, getPackageRoot } from '../../../../shared/paths.js';
 import { currentUserSettingsSaveCount } from '../../../../shared/context-invalidation.js';
 import { getProjectContext } from '../../../../utils/project-name.js';
 import { isProjectExcluded } from '../../../../utils/project-filter.js';
@@ -45,7 +45,10 @@ import { teamBriefReserveChars } from '../../../../shared/teambrain.js';
 import { ProgressiveMemorySearch } from '../../ProgressiveMemorySearch.js';
 import { progressiveSearchToolResult, progressiveSearchToolError, type ProgressiveSearchInput } from '../../../../shared/progressive-search.js';
 
-const ONBOARDING_EXPLAINER_PATH: string = path.resolve(__dirname, '../skills/how-it-works/onboarding-explainer.md');
+const ONBOARDING_EXPLAINER_PATH: string = path.join(
+  getPackageRoot(),
+  'skills/how-it-works/onboarding-explainer.md'
+);
 
 // Read on first request, not at import. Hook processes share this module but
 // never serve the onboarding explainer, so caching at import made every hook

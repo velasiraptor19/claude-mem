@@ -106,6 +106,12 @@ function makeQueue(session: ActiveSession, messages: unknown[]) {
         yield pending[0];
       }
     },
+    handleMalformedOutput: async () => {
+      // Model a durable handoff so this harness measures context growth, not repair.
+      if (claimed) pending.shift();
+      claimed = false;
+      return { retry: false, retryCount: 3 };
+    },
     confirmClaimedMessages: async () => {
       if (claimed) pending.shift();
       claimed = false;

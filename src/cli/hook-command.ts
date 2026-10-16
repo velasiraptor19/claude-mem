@@ -1,3 +1,4 @@
+import { ReleaseWindowManager } from '../services/release/ReleaseWindow.js';
 import { readJsonFromStdin } from './stdin-reader.js';
 import { getPlatformAdapter } from './adapters/index.js';
 import { AdapterRejectedInput } from './adapters/errors.js';
@@ -80,6 +81,25 @@ async function executeHookPipeline(
 }
 
 export async function hookCommand(rawPlatform: string, event: string, options: HookCommandOptions = {}): Promise<number> {
+  const releaseLease = new ReleaseWindowManager().tryAcquireHookLease();
+  if (!releaseLease) {
+    resetHookIoState();
+    emitModelContext(getPlatformAdapter(canonicalIntegrationId(rawPlatform)), buildNoOpResult(event));
+    await exitGraceful(options);
+    return HOOK_EXIT_CODES.SUCCESS;
+  }
+  try {
+    // Release the lease before process.exit; finally cannot run after it.
+    const result = await runHookCommand(rawPlatform, event, { ...options, skipExit: true });
+    releaseLease();
+    await exitGraceful(options);
+    return result;
+  } finally {
+    releaseLease();
+  }
+}
+
+async function runHookCommand(rawPlatform: string, event: string, options: HookCommandOptions): Promise<number> {
   const platform = canonicalIntegrationId(rawPlatform);
   resetHookIoState();
   resetWorkerUnreachableState();

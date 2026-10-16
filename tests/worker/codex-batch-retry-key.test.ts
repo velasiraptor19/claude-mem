@@ -4,10 +4,7 @@ import { SessionManager } from '../../src/services/worker/SessionManager.js';
 import { SettingsDefaultsManager } from '../../src/shared/SettingsDefaultsManager.js';
 import type { PendingMessage, PendingMessageWithId } from '../../src/services/worker-types.js';
 
-// R4-12: the skip contract gives a rejected batch one retry, keyed on the
-// batch. A Codex retry claims the observations queued behind the head since
-// the first try, so a batch that kept growing was retried once per growth
-// step instead of once.
+// Growing batches retain the oldest malformed retry count and enter durable recovery.
 
 const originalLoad = SettingsDefaultsManager.loadFromFile;
 afterEach(() => { SettingsDefaultsManager.loadFromFile = originalLoad; });
@@ -48,17 +45,30 @@ function harness() {
     await provider.processObservationMessage(session, head, undefined, { model: '', apiKey: 'x' }, head._originalTimestamp, undefined);
     return session.abortReason as string | undefined;
   };
-  return { buffer, enqueue, attempt };
+  return { buffer, enqueue, attempt, session, manager };
 }
 
-describe('a growing Codex batch keeps its one retry', () => {
-  it('drops the batch on its second rejection even though it grew in between', async () => {
+describe('a growing Codex batch has bounded malformed repair', () => {
+  it('keeps the head retry count and durably queues the grown batch without dropping it', async () => {
     const h = harness();
-    h.enqueue();
-    expect(await h.attempt()).toMatch(/^output_retry:/);
+    const recover = mock(async () => {});
+    h.manager.setOnMalformedOutputExhausted(recover);
+    const firstId = h.enqueue();
+    expect(await h.attempt()).toBeUndefined();
+    expect(h.session.consecutiveInvalidOutputs).toBe(1);
+    expect(h.buffer.getPendingCount(1)).toBe(1);
 
-    h.enqueue(); // queued behind the head before the retry; the retry folds it in
-    expect(await h.attempt()).toBeUndefined(); // dropped, not retried again
+    const secondId = h.enqueue();
+    expect(await h.attempt()).toBeUndefined();
+    expect(h.session.consecutiveInvalidOutputs).toBe(2);
+    expect(h.buffer.getPendingCount(1)).toBe(2);
+    expect(recover).not.toHaveBeenCalled();
+
+    expect(await h.attempt()).toBeUndefined();
+    expect(h.session.consecutiveInvalidOutputs).toBe(3);
+    expect(recover).toHaveBeenCalledTimes(1);
+    expect((recover.mock.calls[0] as any)[0].messages).toHaveLength(2);
     expect(h.buffer.getPendingCount(1)).toBe(0);
+    expect(h.buffer.getMessagesByIds(1, [firstId, secondId])).toHaveLength(2);
   });
 });

@@ -977,7 +977,7 @@ export class ChromaSync {
     platformSource?: string,
     replaceExisting = false,
     loadCurrent?: () => CurrentRow<StoredSummary> | undefined
-  ): Promise<void> {
+  ): Promise<{ expected: number; written: number; complete: boolean }> {
     const stored: StoredSummary = {
       id: summaryId,
       memory_session_id: memorySessionId,
@@ -998,7 +998,7 @@ export class ChromaSync {
     const release = await this.acquireRowWriter('summaries', summaryId);
     try {
       const loaded = loadCurrent?.();
-      if (loadCurrent && !loaded) return;
+      if (loadCurrent && !loaded) return { expected: 0, written: 0, complete: true };
       const current = loaded?.row ?? stored;
       replaceExisting ||= loaded?.replaceExisting ?? false;
       project = current.project;
@@ -1022,6 +1022,7 @@ export class ChromaSync {
           written
         });
       }
+      return { expected: documents.length, written, complete: written === documents.length };
     } finally {
       release();
     }

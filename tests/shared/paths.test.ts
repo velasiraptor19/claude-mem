@@ -1,14 +1,8 @@
 import { describe, it, expect, afterEach } from 'bun:test';
-import {
-  paths,
-  DATA_DIR,
-  resolveDataDir,
-  ensureObserverSessionsDir,
-  expandHome,
-} from '../../src/shared/paths.js';
+import { paths, DATA_DIR, resolveDataDir, expandHome, getPackageRoot, ensureObserverSessionsDir } from '../../src/shared/paths.js';
 import { homedir, tmpdir } from 'os';
 import { join } from 'path';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 
 describe('paths namespace', () => {
   it('exposes at least the known core accessors', () => {
@@ -77,6 +71,54 @@ describe('expandHome', () => {
 
   it('does not touch a ~user/ form (out of scope)', () => {
     expect(expandHome('~someone/data')).toBe('~someone/data');
+  });
+});
+
+describe('getPackageRoot installed layouts', () => {
+  function createInstalledPlugin(parts: string[], packageJson = true): { home: string; root: string } {
+    const home = mkdtempSync(join(tmpdir(), 'claude-mem-package-root-'));
+    const root = join(home, ...parts);
+    mkdirSync(join(root, 'scripts'), { recursive: true });
+    mkdirSync(join(root, 'ui'), { recursive: true });
+    mkdirSync(join(root, 'skills'), { recursive: true });
+    if (packageJson) writeFileSync(join(root, 'package.json'), '{"name":"claude-mem"}');
+    writeFileSync(join(root, 'scripts', 'worker-service.cjs'), '');
+    writeFileSync(join(root, 'ui', 'viewer.html'), '<!doctype html>');
+    return { home, root };
+  }
+
+  for (const [host, parts] of [
+    ['Claude', ['.claude', 'plugins', 'cache', 'thedotmack', 'claude-mem', '13.13.0']],
+    ['Codex', ['.codex', 'plugins', 'cache', 'claude-mem-local', 'claude-mem', '13.13.0']],
+  ] as const) {
+    it(`resolves the ${host} cache root from the launched worker, ignoring a baked source dirname`, () => {
+      const installed = createInstalledPlugin([...parts]);
+      try {
+        expect(getPackageRoot({
+          entryScript: join(installed.root, 'scripts', 'worker-service.cjs'),
+          moduleDir: '/build/source/src/shared',
+          cwd: '/unrelated/cwd',
+        })).toBe(installed.root);
+      } finally {
+        rmSync(installed.home, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it('resolves a Claude marketplace plugin payload without package.json', () => {
+    const installed = createInstalledPlugin(
+      ['.claude', 'plugins', 'marketplaces', 'thedotmack', 'plugin'],
+      false,
+    );
+    try {
+      expect(getPackageRoot({
+        entryScript: join(installed.root, 'scripts', 'worker-service.cjs'),
+        moduleDir: join(installed.home, '.claude', 'plugins', 'marketplaces', 'thedotmack', 'src', 'shared'),
+        cwd: '/unrelated/cwd',
+      })).toBe(installed.root);
+    } finally {
+      rmSync(installed.home, { recursive: true, force: true });
+    }
   });
 });
 

@@ -5,6 +5,7 @@ import path from 'path';
 import { existsSync, renameSync } from 'fs';
 import { getPackageRoot, paths, expandTilde } from '../../../../shared/paths.js';
 import { logger } from '../../../../utils/logger.js';
+import { validateNvidiaSettings } from '../../NvidiaProvider.js';
 import { SettingsManager } from '../../SettingsManager.js';
 import { MIN_CONTEXT_WINDOW_TOKENS, OBSERVER_MAX_OUTPUT_TOKENS_BOUNDS } from '../../context-window.js';
 import { ModeManager } from '../../../domain/ModeManager.js';
@@ -31,6 +32,7 @@ const updateSettingsSchema = z.object({}).passthrough();
 // CLAUDE_MEM_CONTEXT_SHOW_READ_TOKENS / SHOW_WORK_TOKENS (boolean display
 // prefs) and corrupts them on every GET (#3680 / #3861).
 const SECRET_SETTING_KEYS = new Set([
+  'CLAUDE_MEM_NVIDIA_API_KEY',
   'CLAUDE_MEM_GEMINI_API_KEY',
   // The rotation pools hold credentials exactly like the singular keys above.
   // Leaving them out would mask the primary key and hand back every rotation
@@ -268,6 +270,16 @@ export class SettingsRoutes extends BaseRouteHandler {
       'CLAUDE_MEM_OBSERVER_MAX_OUTPUT_TOKENS',
       'CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER',
       'CLAUDE_MEM_QUOTA_FALLBACK_MODEL',
+      'CLAUDE_MEM_NVIDIA_API_KEY',
+      'CLAUDE_MEM_NVIDIA_BASE_URL',
+      'CLAUDE_MEM_NVIDIA_ALLOW_INSECURE_GATEWAY',
+      'CLAUDE_MEM_NVIDIA_OBSERVATION_MODEL',
+      'CLAUDE_MEM_NVIDIA_SUMMARY_MODEL',
+      'CLAUDE_MEM_NVIDIA_MAX_INPUT_TOKENS',
+      'CLAUDE_MEM_NVIDIA_MAX_OUTPUT_TOKENS',
+      'CLAUDE_MEM_NVIDIA_TEMPERATURE',
+      'CLAUDE_MEM_NVIDIA_TOP_P',
+      'CLAUDE_MEM_NVIDIA_RPM_LIMIT',
       'CLAUDE_MEM_DATA_DIR',
       'CLAUDE_MEM_LOG_LEVEL',
       'CLAUDE_MEM_PYTHON_VERSION',
@@ -355,9 +367,9 @@ export class SettingsRoutes extends BaseRouteHandler {
     }
 
     if (settings.CLAUDE_MEM_PROVIDER) {
-    const validProviders = ['claude', 'gemini', 'openrouter', 'codex', 'openai-compatible'];
+    const validProviders = ['claude', 'gemini', 'openrouter', 'codex', 'openai-compatible', 'nvidia'];
     if (!validProviders.includes(settings.CLAUDE_MEM_PROVIDER)) {
-      return { valid: false, error: 'CLAUDE_MEM_PROVIDER must be "claude", "gemini", "openrouter", "codex", or "openai-compatible"' };
+      return { valid: false, error: 'CLAUDE_MEM_PROVIDER must be "claude", "gemini", "openrouter", "codex", "openai-compatible", or "nvidia"' };
       }
     }
 
@@ -524,6 +536,8 @@ export class SettingsRoutes extends BaseRouteHandler {
         return { valid: false, error: 'CLAUDE_MEM_OPENROUTER_SITE_URL must be a valid URL' };
       }
     }
+    const nvidiaError = validateNvidiaSettings(settings);
+    if (nvidiaError) return { valid: false, error: nvidiaError };
 
     if (settings.CLAUDE_MEM_OPENROUTER_BASE_URL) {
       if (!isHttpUrl(settings.CLAUDE_MEM_OPENROUTER_BASE_URL)) {

@@ -1579,6 +1579,21 @@ describe('ChromaMcpManager singleton enforcement (#2313)', () => {
     }
   });
 
+  it('keeps a Node writer with its recorded executable name when the OS reports MainThread', async () => {
+    const other = realChildProcess.spawn('node', ['-e', 'process.stdout.write("ready"); setTimeout(() => {}, 30000)'], { stdio: ['ignore', 'pipe', 'ignore'] });
+    try {
+      await new Promise<void>((resolve, reject) => { other.stdout.once('data', () => resolve()); other.once('error', reject); other.once('exit', () => reject(new Error('Node child exited before readiness'))); });
+      mkdirSync(mockedChromaDir, { recursive: true });
+      writeFileSync(chromaWriterLockPath(), JSON.stringify({
+        pid: other.pid, ownerId: 'node-worker-owner', dataDir: mockedChromaDir,
+        acquiredAt: new Date().toISOString(), startToken: null, processName: 'node',
+      }));
+      const mgr = ChromaMcpManager.getInstance();
+      await expect(mgr.callTool('chroma_list_collections', { limit: 1 })).rejects.toThrow('already owned by PID');
+      expect(transportInstances.length).toBe(0);
+    } finally { other.kill(); }
+  });
+
   it('allows a new manager instance in this process to re-acquire its writer lock', async () => {
     const firstManager = ChromaMcpManager.getInstance();
     await firstManager.callTool('chroma_list_collections', { limit: 1 });

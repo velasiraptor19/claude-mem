@@ -202,7 +202,8 @@ function trackChild(child: ChildProcess): TrackedChild | null {
 }
 
 /** Runtimes a Chroma writer (the worker) can run under. */
-const CHROMA_WRITER_RUNTIMES = new Set(['bun', 'node']);
+// Node 24 can expose its main thread name as comm; it is not proof of PID reuse.
+const CHROMA_WRITER_RUNTIMES = new Set(['bun', 'node', 'mainthread']);
 
 interface ChromaWriterLockPayload {
   pid: number;
@@ -887,6 +888,7 @@ export class ChromaMcpManager {
       // under either JS runtime, so any of them keeps such a lock.
       const currentName = captureProcessName(lock.pid);
       if (currentName === null) return true;
+      if (currentName === 'mainthread') return true;
       if (lock.processName) return isSameProcessName(currentName, lock.processName);
       return isSameProcessName(currentName, normalizeProcessName(process.execPath)) || CHROMA_WRITER_RUNTIMES.has(currentName);
     }

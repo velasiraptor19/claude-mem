@@ -34,10 +34,11 @@ function getPrompt(mode: ModeConfig, key: RequiredPromptKey): string {
 }
 
 function observationSkeleton(mode: ModeConfig): string {
+  const exampleType = mode.observation_types[0]?.id ?? 'discovery';
   return `${getPrompt(mode, 'output_format_header')}
 
 <observation>
-  <type>[ ${mode.observation_types.map(t => t.id).join(' | ')} ]</type>
+  <type>${exampleType}</type> <!-- choose exactly one: ${mode.observation_types.map(t => t.id).join(' | ')} -->
   <!--
     ${getPrompt(mode, 'type_guidance')}
   -->

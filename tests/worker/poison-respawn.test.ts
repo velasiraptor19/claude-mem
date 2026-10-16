@@ -76,7 +76,7 @@ describe('observer invalid-output handling (Phase 3 recovery)', () => {
     mock.restore();
   });
 
-  it('asks again once, in a fresh generation, for a reply that is neither XML nor the skip sentinel', async () => {
+  it('quarantines context-window prose without acknowledging or discarding the claimed batch', async () => {
     const sm = new SessionManager(makeDbManager());
     const session = sm.initializeSession(1, 'do the thing', 1);
     session.memorySessionId = 'mem-1';
@@ -97,19 +97,15 @@ describe('observer invalid-output handling (Phase 3 recovery)', () => {
       'TestAgent',
     );
 
-    // Not confirmed: the batch is back in the queue, and the generator stops
-    // so the retry runs in a fresh generation without this reply in it.
     expect(confirmSpy).not.toHaveBeenCalled();
-    expect(resetSpy).toHaveBeenCalledWith(1);
+    expect(resetSpy).not.toHaveBeenCalled();
     expect(sm.getMessageBuffer().getPendingCount(1)).toBe(1);
-    expect(session.claimedMessageIds).toEqual([]);
     expect(session.consecutiveInvalidOutputs).toBe(1);
-    expect(session.abortReason).toStartWith('output_retry:');
-    expect(session.abortController.signal.aborted).toBe(true);
-    expect(worker.broadcastProcessingStatus).toHaveBeenCalled();
+    expect(session.abortController.signal.aborted).toBe(false);
+    expect(session.abortReason ?? null).toBeNull();
   });
 
-  it('drops a batch rejected twice, with an error, instead of looping on it', async () => {
+  it('repeated no-op prose is bounded and quarantined without losing work', async () => {
     const sm = new SessionManager(makeDbManager());
     const session = sm.initializeSession(2, 'do the thing', 1);
     session.memorySessionId = 'mem-2';
@@ -121,119 +117,23 @@ describe('observer invalid-output handling (Phase 3 recovery)', () => {
       'No observations to record.', session, makeDbManager(), sm, makeWorker(), 0, null, 'TestAgent',
     );
 
-    await answer();
-    expect(resetSpy).toHaveBeenCalledTimes(1);
+    for (let i = 0; i < 5; i++) {
+      await processAgentResponse(
+        'No observations to record.',
+        session,
+        makeDbManager(),
+        sm,
+        makeWorker(),
+        0,
+        null,
+        'TestAgent',
+      );
+      expect(session.abortController.signal.aborted).toBe(false);
+    }
+
     expect(confirmSpy).not.toHaveBeenCalled();
-
-    // The retry generation claims the same batch and gets the same answer.
-    restartGeneration(session);
-    await claimAgain(sm, 2);
-    const resetsBeforeSecondAnswer = resetSpy.mock.calls.length;
-    await answer();
-
-    expect(confirmSpy).toHaveBeenCalledWith(2);
-    expect(resetSpy.mock.calls.length).toBe(resetsBeforeSecondAnswer);
-    expect(logger.error).toHaveBeenCalled();
-    expect(sm.getMessageBuffer().getPendingCount(2)).toBe(0);
-    expect(session.claimedMessageIds).toEqual([]);
-    expect(session.consecutiveInvalidOutputs).toBe(0);
-    expect(session.abortController.signal.aborted).toBe(false);
-  });
-
-  it('starts a fresh count for the next batch after a drop', async () => {
-    const sm = new SessionManager(makeDbManager());
-    const session = sm.initializeSession(12, 'do the thing', 1);
-    session.memorySessionId = 'mem-12';
-    await queueAndClaimOne(sm, 12);
-    const answer = () => processAgentResponse(
-      'Nothing worth recording here.', session, makeDbManager(), sm, makeWorker(), 0, null, 'TestAgent',
-    );
-
-    await answer();
-    restartGeneration(session);
-    await claimAgain(sm, 12);
-    await answer();
-    expect(sm.getMessageBuffer().getPendingCount(12)).toBe(0);
-
-    // A different batch earns its own retry.
-    restartGeneration(session);
-    await sm.queueObservation(12, {
-      tool_name: 'Read', tool_input: {}, tool_response: {}, prompt_number: 1, toolUseId: 'tu-12-next',
-    });
-    await claimAgain(sm, 12);
-    await answer();
-    expect(sm.getMessageBuffer().getPendingCount(12)).toBe(1);
-    expect(session.abortReason).toStartWith('output_retry:');
-  });
-
-  it('keeps a batch\'s rejection count across a pause, so a later rejection still drops it', async () => {
-    const sm = new SessionManager(makeDbManager());
-    const session = sm.initializeSession(13, 'do the thing', 1);
-    session.memorySessionId = 'mem-13';
-    await queueAndClaimOne(sm, 13);
-    const reply = (text: string) => processAgentResponse(
-      text, session, makeDbManager(), sm, makeWorker(), 0, null, 'TestAgent',
-    );
-
-    await reply('Nothing worth recording here.');
-    restartGeneration(session);
-    await claimAgain(sm, 13);
-    await reply('Claude usage limit reached. Your weekly limit will reset soon.');
-    expect(session.abortReason).toBe('quota:observer_text');
-    expect(session.consecutiveInvalidOutputs).toBe(1);
-
-    restartGeneration(session);
-    await claimAgain(sm, 13);
-    await reply('Nothing worth recording here.');
-    expect(sm.getMessageBuffer().getPendingCount(13)).toBe(0);
-    expect(session.abortController.signal.aborted).toBe(false);
-  });
-
-  it('confirms the <skip_summary /> sentinel at once: a skip is an answer', async () => {
-    const sm = new SessionManager(makeDbManager());
-    const session = sm.initializeSession(14, 'do the thing', 1);
-    session.memorySessionId = 'mem-14';
-    await queueAndClaimOne(sm, 14);
-
-    const confirmSpy = spyOn(sm, 'confirmClaimedMessages');
-    const resetSpy = spyOn(sm, 'resetProcessingToPending');
-
-    await processAgentResponse(
-      '<skip_summary reason="noise" />', session, makeDbManager(), sm, makeWorker(), 0, null, 'TestAgent',
-    );
-
-    expect(confirmSpy).toHaveBeenCalledWith(14);
     expect(resetSpy).not.toHaveBeenCalled();
-    expect(sm.getMessageBuffer().getPendingCount(14)).toBe(0);
-    expect(session.consecutiveInvalidOutputs).toBe(0);
-    expect(session.abortController.signal.aborted).toBe(false);
-  });
-
-  it('output-retry generator exit keeps the active session and in-memory buffer', async () => {
-    const sm = new SessionManager(makeDbManager());
-    const session = sm.initializeSession(15, 'do the thing', 1);
-    session.memorySessionId = 'mem-15';
-    session.currentProvider = 'claude';
-    session.generatorPromise = Promise.resolve();
-    await queueAndClaimOne(sm, 15);
-
-    await processAgentResponse(
-      'No observations to record.', session, makeDbManager(), sm, makeWorker(), 0, null, 'TestAgent',
-    );
-
-    const finalizeSession = mock(() => Promise.resolve());
-    const removeSpy = spyOn(sm, 'removeSessionImmediate');
-
-    await handleGeneratorExit(session, session.abortReason, {
-      sessionManager: sm,
-      completionHandler: { finalizeSession } as any,
-    });
-
-    expect(finalizeSession).not.toHaveBeenCalled();
-    expect(removeSpy).not.toHaveBeenCalled();
-    expect(sm.getSession(15)).toBe(session);
-    expect(sm.getMessageBuffer().getPendingCount(15)).toBe(1);
-    expect(session.pausedReason).toBe('output_retry');
+    expect(sm.getMessageBuffer().getPendingCount(2)).toBe(1);
   });
 
   it('pauses on weekly-limit quota prose and preserves claimed pending work', async () => {
@@ -331,7 +231,7 @@ describe('observer invalid-output handling (Phase 3 recovery)', () => {
     expect(session.abortController.signal.aborted).toBe(true);
   });
 
-  it('treats unrelated login instructions as ordinary prose, not an auth pause', async () => {
+  it('preserves unrelated login prose as malformed output pending repair', async () => {
     const sm = new SessionManager(makeDbManager());
     const session = sm.initializeSession(10, 'do the thing', 1);
     session.memorySessionId = 'mem-10';
@@ -352,12 +252,12 @@ describe('observer invalid-output handling (Phase 3 recovery)', () => {
     );
 
     expect(confirmSpy).not.toHaveBeenCalled();
-    expect(resetSpy).toHaveBeenCalledWith(10);
+    expect(resetSpy).not.toHaveBeenCalled();
     expect(sm.getMessageBuffer().getPendingCount(10)).toBe(1);
-    expect(session.abortReason).toBe('output_retry:prose');
+    expect(session.abortController.signal.aborted).toBe(false);
   });
 
-  it('treats project auth-guide prose as ordinary prose, not an auth pause', async () => {
+  it('preserves project auth-guide prose as malformed output pending repair', async () => {
     const sm = new SessionManager(makeDbManager());
     const session = sm.initializeSession(11, 'do the thing', 1);
     session.memorySessionId = 'mem-11';
@@ -378,9 +278,9 @@ describe('observer invalid-output handling (Phase 3 recovery)', () => {
     );
 
     expect(confirmSpy).not.toHaveBeenCalled();
-    expect(resetSpy).toHaveBeenCalledWith(11);
+    expect(resetSpy).not.toHaveBeenCalled();
     expect(sm.getMessageBuffer().getPendingCount(11)).toBe(1);
-    expect(session.abortReason).toBe('output_retry:prose');
+    expect(session.abortController.signal.aborted).toBe(false);
   });
 
   it('auth generator exit keeps the active session and in-memory buffer', async () => {
@@ -451,7 +351,7 @@ describe('observer invalid-output handling (Phase 3 recovery)', () => {
     expect(session.currentProvider).toBeNull();
   });
 
-  it('confirms a skip but preserves the same queue shape for a quota pause', async () => {
+  it('acknowledges explicit skip but preserves quota pauses', async () => {
     const skipSm = new SessionManager(makeDbManager());
     const skipSession = skipSm.initializeSession(4, 'do the thing', 1);
     skipSession.memorySessionId = 'mem-4';

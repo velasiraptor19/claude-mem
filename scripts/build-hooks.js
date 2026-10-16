@@ -529,6 +529,8 @@ async function buildHooks() {
     console.log(`\n🔧 Building worker service...`);
     await build({
       entryPoints: [WORKER_SERVICE.source],
+      // Escape codec table control characters without trimming literal data.
+      supported: { 'template-literal': false },
       bundle: true,
       platform: 'node',
       target: 'node18',
@@ -662,6 +664,8 @@ async function buildHooks() {
     console.log(`\n🔧 Building server beta service...`);
     await build({
       entryPoints: [SERVER_SERVICE.source],
+      // Escape codec table control characters without trimming literal data.
+      supported: { 'template-literal': false },
       bundle: true,
       platform: 'node',
       target: 'node18',

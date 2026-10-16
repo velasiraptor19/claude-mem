@@ -136,8 +136,9 @@ describe('Codex observation batching', () => {
     const h = harness(2); const ids = [h.enqueue(), h.enqueue(), h.enqueue()];
     h.provider.query = async () => ({ content: 'Skipping' });
     await h.process(h.first());
-    // main's skip contract (#3624): one more try in a fresh generation, batch intact
-    expect(h.session.abortReason).toBe('output_retry:prose');
+    // Maintained repair preserves the whole batch with a bounded in-process retry.
+    expect(h.session.consecutiveInvalidOutputs).toBe(1);
+    expect(h.session.abortController.signal.aborted).toBe(false);
     expect(h.buffer.getPendingCount(1)).toBe(3);
     expect(h.buffer.claimNextMatching(1, () => true)?._persistentId).toBe(ids[0]);
   });

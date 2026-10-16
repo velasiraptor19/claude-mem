@@ -58,6 +58,75 @@ const OBSERVATION_SCHEMA_TAGS = new Set([
   'type', 'title', 'subtitle', 'narrative', 'facts', 'fact', 'concepts', 'concept',
   'files_read', 'files_modified', 'file',
 ]);
+/**
+ * NVIDIA occasionally mirrors the formatting of the type legend instead of
+ * emitting the bare enum value, e.g. `[change]` or `[**type**: discovery]`.
+ * Keep the vocabulary closed: an observation type is used by filters,
+ * telemetry and context compilation, so accepting prose here pollutes all
+ * three. Unknown values intentionally fall back to the active mode's first
+ * type; the original malformed value remains in the parser log for diagnosis.
+ */
+function normalizeObservationType(rawType: string, validTypes: string[]): string | null {
+  const trimmed = rawType.trim();
+  const direct = validTypes.find(type => type.toLowerCase() === trimmed.toLowerCase());
+  if (direct) return direct;
+
+  const escapeRegex = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const canonical = validTypes.map(escapeRegex).join('|');
+  // Accept a canonical enum only when it appears in the conventional leading
+  // type position. Do not infer from arbitrary prose such as a title.
+  const wrapped = new RegExp(
+    `^[\\s\\[*_]*?(?:\\*{1,2}\\s*)?(?:(?:\\*{0,2}type\\*{0,2})\\s*:\\s*)?(${canonical})\\b`,
+    'i'
+  ).exec(trimmed);
+  if (wrapped) {
+    return validTypes.find(type => type.toLowerCase() === wrapped[1].toLowerCase()) ?? null;
+  }
+
+  // These are stable short aliases emitted by the NVIDIA model. They denote
+  // the same intent as the canonical code-mode categories.
+  const aliases: Record<string, string> = {
+    error: 'discovery',
+    patch: 'change',
+    pattern: 'discovery',
+  };
+  const alias = aliases[trimmed.toLowerCase()];
+  return alias && validTypes.includes(alias) ? alias : null;
+}
+
+// NVIDIA can leak its Markdown field labels into <title>, e.g.
+// `[**title**: Worker healthy]` or `[**Discovery**]: inspected parser`.
+// This is presentation-only syntax, never part of the observation title.
+function normalizeObservationTitle(rawTitle: string): string | null {
+  const trimmed = rawTitle.trim();
+  const titleMatch = /^\[\*\*title\*\*:\s*/i.exec(trimmed);
+  if (titleMatch) {
+    const content = trimmed.slice(titleMatch[0].length).trim();
+    const normalized = content.endsWith(']') ? content.slice(0, -1).trim() : content;
+    // A bare Markdown label carries no semantic title. Preserve the absence
+    // instead of introducing a synthetic UI label into persistent memory.
+    return normalized || null;
+  }
+
+  const typedMatch = /^\[\*\*(?:bugfix|feature|refactor|change|discovery|decision|security_alert|security_note|sensitive)\*\*(?:\]\s*:?\s*|:\s*)/i.exec(trimmed);
+  if (!typedMatch) return trimmed;
+  const content = trimmed.slice(typedMatch[0].length).trim();
+  const normalized = typedMatch[0].includes(':') && content.endsWith(']') ? content.slice(0, -1).trim() : content;
+  return normalized || null;
+}
+
+// NVIDIA can also echo the XML field name as Markdown inside the corresponding
+// value, e.g. `<subtitle>[**subtitle**: concise detail]</subtitle>`.  Only
+// remove the matching field label: arbitrary Markdown labels such as
+// `[**timed_out**]` carry user-visible meaning and must remain untouched.
+function normalizeObservationFieldLabel(rawValue: string, field: 'subtitle' | 'narrative'): string | null {
+  const trimmed = rawValue.trim();
+  const fieldMatch = new RegExp(`^\\[\\*\\*${field}\\*\\*:\\s*`, 'i').exec(trimmed);
+  if (!fieldMatch) return trimmed;
+  const content = trimmed.slice(fieldMatch[0].length).trim();
+  const normalized = content.endsWith(']') ? content.slice(0, -1).trim() : content;
+  return normalized || null;
+}
 
 export function parseAgentXml(raw: string, correlationId?: string | number): ParseResult {
   if (typeof raw !== 'string' || !raw.trim()) {
@@ -125,9 +194,21 @@ function parseObservationBlocks(
     const obsContent = match[1];
 
     const type = extractField(obsContent, 'type');
-    const title = unwrapLabelWrappedTitle(extractField(obsContent, 'title'));
-    const subtitle = extractField(obsContent, 'subtitle');
-    const narrative = extractField(obsContent, 'narrative');
+    const rawTitle = extractField(obsContent, 'title');
+    const title = rawTitle ? normalizeObservationTitle(unwrapLabelWrappedTitle(rawTitle) ?? '') : null;
+    if (rawTitle && title !== rawTitle) {
+      logger.warn('PARSER', `Normalized observation title wrapper: ${rawTitle.slice(0, 80)}`, { correlationId });
+    }
+    const rawSubtitle = extractField(obsContent, 'subtitle');
+    const subtitle = rawSubtitle ? normalizeObservationFieldLabel(rawSubtitle, 'subtitle') : null;
+    if (rawSubtitle && subtitle !== rawSubtitle) {
+      logger.warn('PARSER', `Normalized observation subtitle wrapper: ${rawSubtitle.slice(0, 80)}`, { correlationId });
+    }
+    const rawNarrative = extractField(obsContent, 'narrative');
+    const narrative = rawNarrative ? normalizeObservationFieldLabel(rawNarrative, 'narrative') : null;
+    if (rawNarrative && narrative !== rawNarrative) {
+      logger.warn('PARSER', `Normalized observation narrative wrapper: ${rawNarrative.slice(0, 80)}`, { correlationId });
+    }
     const facts = extractArrayElements(obsContent, 'facts', 'fact');
     const concepts = extractArrayElements(obsContent, 'concepts', 'concept');
     const files_read = extractArrayElements(obsContent, 'files_read', 'file');
@@ -138,9 +219,14 @@ function parseObservationBlocks(
     const fallbackType = validTypes[0];
     let finalType = fallbackType;
     if (type) {
-      finalType = type;
-      if (!validTypes.includes(type)) {
-        logger.error('PARSER', `Invalid observation type: ${type}, preserving emitted type`, { correlationId });
+      const normalizedType = normalizeObservationType(type, validTypes);
+      if (normalizedType) {
+        finalType = normalizedType;
+        if (normalizedType !== type) {
+          logger.warn('PARSER', `Normalized observation type: ${type} -> ${normalizedType}`, { correlationId });
+        }
+      } else {
+        logger.warn('PARSER', `Invalid observation type: ${type}, using "${fallbackType}"`, { correlationId });
       }
     } else {
       logger.error('PARSER', `Observation missing type field, defaulting to the first declared type: "${fallbackType}"`, { correlationId });

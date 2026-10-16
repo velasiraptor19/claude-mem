@@ -36,6 +36,7 @@ import { runWorkerDependencyPreflight } from './worker/dependency-preflight.js';
 import { provisionTreeSitterCliForPluginRoot } from './worker/tree-sitter-cli-provisioning.js';
 import { IdleExitMonitor, MIN_IDLE_EXIT_MS, parseIdleExitMs } from './worker/idle-exit-monitor.js';
 import { isWorkerAutostartDisabled } from '../shared/worker-autostart.js';
+import { ReleaseWindowManager } from './release/ReleaseWindow.js';
 
 export { isPluginDisabledInClaudeSettings } from '../shared/plugin-state.js';
 import { isPluginDisabledInClaudeSettings } from '../shared/plugin-state.js';
@@ -119,6 +120,7 @@ import { OpenRouterProvider, classifyOpenRouterError } from './worker/OpenRouter
 import { OpenAICompatProvider } from './worker/OpenAICompatProvider.js';
 import { getSelectedProvider } from './worker/provider-dispatch.js';
 import { CodexProvider } from './worker/CodexProvider.js';
+import { NvidiaProvider, isNvidiaSelected, isNvidiaAvailable } from './worker/NvidiaProvider.js';
 import { ClassifiedProviderError, isClassified, type ProviderErrorClass } from './worker/provider-errors.js';
 import { PaginationHelper } from './worker/PaginationHelper.js';
 import { SettingsManager } from './worker/SettingsManager.js';
@@ -128,6 +130,10 @@ import { FormattingService } from './worker/FormattingService.js';
 import { TimelineService } from './worker/TimelineService.js';
 import { SessionEventBroadcaster } from './worker/events/SessionEventBroadcaster.js';
 import { SessionCompletionHandler } from './worker/session/SessionCompletionHandler.js';
+import { RecoveryJobService } from './recovery/RecoveryJobService.js';
+import { RecoveryConsumer } from './recovery/RecoveryConsumer.js';
+import { HistoricalRecoveryScanner } from './recovery/HistoricalRecoveryScanner.js';
+import { RecoveryScannerScheduler } from './recovery/RecoveryScannerScheduler.js';
 import { setIngestContext, attachIngestGeneratorStarter } from './worker/http/shared.js';
 import { DEFAULT_CONFIG_PATH, DEFAULT_STATE_PATH, expandHomePath, scopeNativeHookBackedCodexWatches, loadTranscriptWatchConfig } from './transcripts/config.js';
 import { TranscriptWatcher } from './transcripts/watcher.js';
@@ -156,6 +162,7 @@ import { CorpusRoutes } from './worker/http/routes/CorpusRoutes.js';
 import { ChromaRoutes } from './worker/http/routes/ChromaRoutes.js';
 import { CloudSyncRoutes } from './worker/http/routes/CloudSyncRoutes.js';
 import { TeamBrainRoutes } from './worker/http/routes/TeamBrainRoutes.js';
+import { RecoveryRoutes } from './worker/http/routes/RecoveryRoutes.js';
 
 import { CorpusStore } from './worker/knowledge/CorpusStore.js';
 import { CorpusBuilder } from './worker/knowledge/CorpusBuilder.js';
@@ -272,10 +279,14 @@ export class WorkerService implements WorkerRef {
   private openRouterAgent: OpenRouterProvider;
   private openAICompatAgent: OpenAICompatProvider;
   private codexAgent: CodexProvider;
+  private nvidiaAgent: NvidiaProvider;
   private paginationHelper: PaginationHelper;
   private settingsManager: SettingsManager;
   private sessionEventBroadcaster: SessionEventBroadcaster;
   private completionHandler: SessionCompletionHandler;
+  private recoveryJobs: RecoveryJobService | null = null;
+  private recoveryConsumer: RecoveryConsumer | null = null;
+  private recoveryScannerScheduler: RecoveryScannerScheduler | null = null;
   private corpusStore: CorpusStore;
 
   private searchRoutes: SearchRoutes | null = null;
@@ -312,6 +323,7 @@ export class WorkerService implements WorkerRef {
     this.openRouterAgent = new OpenRouterProvider(this.dbManager, this.sessionManager);
     this.openAICompatAgent = new OpenAICompatProvider(this.dbManager, this.sessionManager);
     this.codexAgent = new CodexProvider(this.dbManager, this.sessionManager);
+    this.nvidiaAgent = new NvidiaProvider(this.dbManager, this.sessionManager);
 
     this.paginationHelper = new PaginationHelper(this.dbManager);
     this.settingsManager = new SettingsManager(this.dbManager);
@@ -363,7 +375,7 @@ export class WorkerService implements WorkerRef {
         const provider = getSelectedProvider();
         return {
           provider,
-          authMethod: provider === 'codex' ? 'Codex CLI subscription' : getAuthMethodDescription(),
+          authMethod: providerAuthMethodDescription(provider),
           lastInteraction: this.lastAiInteraction
             ? {
                 timestamp: this.lastAiInteraction.timestamp,
@@ -556,7 +568,7 @@ export class WorkerService implements WorkerRef {
     ));
 
     this.server.registerRoutes(new ViewerRoutes(this.sseBroadcaster, this.dbManager, this.sessionManager));
-    const sessionRoutes = new SessionRoutes(this.sessionManager, this.dbManager, this.sdkAgent, this.geminiAgent, this.openRouterAgent, this.sessionEventBroadcaster, this, this.completionHandler, this.codexAgent, this.openAICompatAgent);
+    const sessionRoutes = new SessionRoutes(this.sessionManager, this.dbManager, this.sdkAgent, this.geminiAgent, this.openRouterAgent, this.sessionEventBroadcaster, this, this.completionHandler, this.codexAgent, this.openAICompatAgent, this.nvidiaAgent);
     this.server.registerRoutes(sessionRoutes);
     this.startPendingSessionResume(sessionRoutes);
     attachIngestGeneratorStarter((sessionDbId, source) =>
@@ -570,6 +582,7 @@ export class WorkerService implements WorkerRef {
     this.server.registerRoutes(new MemoryRoutes(this.dbManager, 'claude-mem'));
     this.server.registerRoutes(new MemoryIngestRoutes(this.dbManager));
     this.server.registerRoutes(new DedupRoutes(this.dbManager));
+    this.server.registerRoutes(new RecoveryRoutes(this.dbManager, () => this.recoveryConsumer, generation => this.reconcileReleaseRecovery(generation)));
     this.server.registerRoutes(new ServerV1Routes({
       getDatabase: () => this.dbManager.getConnection(),
     }));
@@ -756,6 +769,38 @@ export class WorkerService implements WorkerRef {
       // Drain it as soon as SQLite is ready (not awaited — a backlog after an
       // outage must not hold readiness), then on watch/nudge/sweep.
       this.startHookSpoolDrain();
+
+      // A successful installer deliberately leaves hooks fenced at
+      // window_closed.  The newly started root worker is the only process
+      // that can prove canonical recovery ran for that exact durable interval
+      // and release the fence.  Do this after SQLite is ready, before normal
+      // hook-triggered work can be accepted.
+      if (new ReleaseWindowManager().current()?.phase === 'window_closed') {
+        await this.reconcileReleaseRecovery();
+      }
+
+      this.recoveryJobs = new RecoveryJobService(this.dbManager.getSessionStore());
+      this.sessionManager.setOnMalformedOutputExhausted(async (event) => {
+        const session = this.dbManager.getSessionById(event.sessionDbId);
+        const jobs = await this.recoveryJobs!.enqueueMalformedBatch(session, event.messages, `malformed_${event.outputClass}`);
+        logger.warn('SESSION', 'Queued malformed summary for durable recovery', {
+          recoveryJobIds: jobs.map(job => job.id),
+          sessionId: event.sessionDbId,
+          contentSessionId: session.content_session_id,
+          project: session.project,
+          platformSource: session.platform_source,
+        });
+      });
+      if (isNvidiaSelected() && isNvidiaAvailable()) {
+        this.recoveryConsumer ??= new RecoveryConsumer(this.dbManager, this.nvidiaAgent);
+        this.recoveryConsumer.start();
+        this.recoveryScannerScheduler = new RecoveryScannerScheduler(() =>
+          new HistoricalRecoveryScanner(this.dbManager.getSessionStore(), undefined, undefined, 5 * 60_000).scan(false, 100),
+        );
+        this.recoveryScannerScheduler.start();
+      } else {
+        logger.warn('SESSION', 'Recovery consumer is paused until native NVIDIA is selected and configured');
+      }
 
       runOneTimeV12_4_3Cleanup();
 
@@ -1012,6 +1057,57 @@ export class WorkerService implements WorkerRef {
     }
   }
 
+  private releaseRecoveryInFlight: Promise<void> | null = null;
+
+  reconcileReleaseRecovery(generation?: number): Promise<void> {
+    if (this.releaseRecoveryInFlight) return Promise.reject(new Error('Canonical release recovery already running'));
+    const run = async () => {
+      const releaseWindow = new ReleaseWindowManager();
+      const pendingRelease = releaseWindow.current();
+      if (generation !== undefined && (pendingRelease?.generation !== generation || pendingRelease.phase !== 'window_closed')) {
+        throw new Error('Canonical release recovery requires the matching closed generation');
+      }
+      if (pendingRelease?.phase === 'window_closed') {
+        if (!isNvidiaSelected() || !isNvidiaAvailable()) {
+          throw new Error('Canonical release recovery requires the configured NVIDIA recovery worker; maintenance fence remains active');
+        }
+        const endedAt = pendingRelease.recoveryBounds.endedAt;
+        if (!endedAt) throw new Error('Closed release window is missing durable recovery bounds');
+        this.recoveryConsumer ??= new RecoveryConsumer(this.dbManager, this.nvidiaAgent);
+        let plan = releaseWindow.canonicalRecoveryPlan(pendingRelease.generation);
+        let report: Awaited<ReturnType<HistoricalRecoveryScanner['scan']>> | null = null;
+        if (!plan) {
+          // Do not use the scheduler's deliberately bounded normal-history
+          // batch here.  This is the release proof and must capture every
+          // canonical turn in the immutable release interval before any job
+          // can release the hook fence.
+          report = await new HistoricalRecoveryScanner(this.dbManager.getSessionStore()).scan(false, Number.POSITIVE_INFINITY, {
+            startedAt: pendingRelease.recoveryBounds.startedAt,
+            endedAt,
+          });
+          if (report.truncated) throw new Error('Canonical recovery scan exceeded its explicit finite discovery budget');
+          plan = releaseWindow.persistCanonicalRecoveryPlan(pendingRelease.generation, report.candidates);
+        }
+        // Process only a finite number of startup attempts.  A retry, dead
+        // letter, queue contention, or any unresolved planned candidate falls
+        // through to the final receipt check and intentionally keeps hooks
+        // fenced instead of pretending that a scan alone recovered the window.
+        const plannedJobKeys = plan.candidates.filter(candidate => candidate.disposition === 'job').map(candidate => candidate.recoveryKey);
+        for (const recoveryKey of plannedJobKeys) await this.recoveryConsumer.tick(true, recoveryKey);
+        releaseWindow.recordCanonicalRecoveryCompletion(pendingRelease.generation, this.dbManager.getSessionStore());
+        logger.info('SYSTEM', 'Canonical release recovery completed', {
+          generation: pendingRelease.generation,
+          recoveryBounds: pendingRelease.recoveryBounds,
+          candidates: plan.candidates.length,
+          enqueued: report?.enqueued ?? 0,
+        });
+      }
+
+    };
+    this.releaseRecoveryInFlight = run().finally(() => { this.releaseRecoveryInFlight = null; });
+    return this.releaseRecoveryInFlight;
+  }
+
   private async runMcpSelfCheck(mcpServerPath: string): Promise<void> {
     try {
       await this.connectMcpLoopback(mcpServerPath);
@@ -1159,6 +1255,10 @@ export class WorkerService implements WorkerRef {
         this.memoryFileWatcher = null;
 
         await this.codexAgent.close();
+        await this.recoveryScannerScheduler?.stop();
+        this.recoveryScannerScheduler = null;
+        await this.recoveryConsumer?.stop();
+        this.recoveryConsumer = null;
         if (this.transcriptWatcher) {
           this.transcriptWatcher.stop();
           this.transcriptWatcher = null;
@@ -1455,6 +1555,12 @@ function runServerApiKeyCli(args: string[]): never {
 
 async function main() {
   const { command, args: commandArgs } = parseWorkerServiceCommand(process.argv.slice(2));
+  if ((command === 'start' || command === 'restart')
+    && !new ReleaseWindowManager().canRequestWorkerStart(process.env.CLAUDE_MEM_MANAGED_START_AUTH)) {
+    logger.warn('SYSTEM', 'Worker start rejected while a managed release window is active');
+    process.exit(WORKER_BOOT_FAILED_EXIT_CODE);
+  }
+
 
   const hookInitiatedCommands = ['start', 'hook', 'restart', '--daemon'];
   if ((command === undefined || hookInitiatedCommands.includes(command)) && isPluginDisabledInClaudeSettings()) {
@@ -1771,6 +1877,7 @@ async function main() {
       restoreHookOriginalCwd();
       const { hookCommand } = await import('../cli/hook-command.js');
       await hookCommand(platform, event);
+
       break;
     }
 
@@ -1881,6 +1988,13 @@ async function main() {
 
     case '--daemon':
     default: {
+      // Redeem only in the process that opens the store, never in its launcher.
+      if (!new ReleaseWindowManager().canStartWorker(process.env.CLAUDE_MEM_MANAGED_START_AUTH)) {
+        logger.warn('SYSTEM', 'Daemon boot rejected while a managed release window is active');
+        process.exit(WORKER_BOOT_FAILED_EXIT_CODE);
+      }
+      delete process.env.CLAUDE_MEM_MANAGED_START_AUTH;
+
       // Before anything below spawns a child (the reclaim probes, the
       // supervisor, chroma-mcp), stand in claude-mem's data dir rather than
       // whatever cwd this daemon was launched with (#3706; EPERM on
@@ -2084,4 +2198,11 @@ if (isMainModule) {
     const isDaemonBoot = command === undefined || command === '--daemon';
     process.exit(isDaemonBoot ? WORKER_BOOT_FAILED_EXIT_CODE : 0);
   });
+}
+export function providerAuthMethodDescription(provider: string): string {
+  if (provider === 'codex') return 'Codex CLI subscription';
+  if (provider === 'nvidia') return 'NVIDIA API key';
+  if (provider === 'openrouter') return 'OpenRouter API key';
+  if (provider === 'gemini') return 'Gemini API key';
+  return getAuthMethodDescription();
 }

@@ -14,6 +14,10 @@ describe('provider account gate', () => {
     expect(providerNeedsAccount('host')).toBe(false);
   });
 
+  it('exempts NVIDIA because its configured API key is the complete credential', () => {
+    expect(providerNeedsAccount('nvidia')).toBe(false);
+  });
+
   it('still requires an account when no provider was named', () => {
     expect(providerNeedsAccount(undefined)).toBe(true);
     expect(source).toContain('if (providerNeedsAccount(options.provider)) {');

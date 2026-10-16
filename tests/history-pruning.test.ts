@@ -168,8 +168,8 @@ function makeSession(): ActiveSession {
 }
 
 /**
- * Records independent snapshots of the serialized wire messages. Replies are non-XML, so
- * processAgentResponse confirms and returns without touching storage.
+ * Records independent snapshots of the serialized wire messages. Non-XML replies
+ * are handed to the recovery queue stub so this fixture isolates history retention.
  */
 class RecordingProvider extends OpenAICompatibleProvider<{ apiKey: string; model: string }> {
   protected readonly providerName = 'TestProvider';
@@ -248,8 +248,14 @@ describe('observer requests across a long generation', () => {
 
   function makeQueue(session: ActiveSession, messages: unknown[]) {
     const pending = [...messages];
+    const recovery: unknown[] = [];
     return {
       pending,
+      recovery,
+      handleMalformedOutput: async () => {
+        recovery.push(pending.shift());
+        return { retry: false, retryCount: 3 };
+      },
       getMessageIterator: async function* () {
         while (pending.length > 0 && !session.abortController.signal.aborted) {
           yield pending[0];
@@ -286,6 +292,7 @@ describe('observer requests across a long generation', () => {
     expect(session.conversationHistory.filter(message => message.role === 'assistant').map(message => message.content))
       .toEqual(Array.from({ length: 41 }, (_, i) => `REPLY_${i}`));
     expect(queue.pending).toHaveLength(0);
+    expect(queue.recovery).toHaveLength(41);
   }, 30_000);
 
   it(`retains raw payloads within each generation and drains ${TURNS} turns through bounded recycling`, async () => {
@@ -301,6 +308,7 @@ describe('observer requests across a long generation', () => {
     }
 
     expect(queue.pending).toHaveLength(0);
+    expect(queue.recovery).toHaveLength(TURNS);
     expect(provider.requests).toHaveLength(TURNS);
     expect(generations).toBeGreaterThan(1);
     expect(Math.max(...provider.requestChars)).toBeLessThan(410_000);

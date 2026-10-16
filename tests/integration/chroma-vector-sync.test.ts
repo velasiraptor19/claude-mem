@@ -214,13 +214,12 @@ describe('ChromaSync Vector Sync Integration', () => {
 
   describe('Error handling', () => {
     it('should handle connection failures gracefully', async () => {
-      if (!chromaAvailable) {
-        console.log(`Skipping: ${skipReason}`);
-        return;
-      }
-
       const { ChromaSync } = await import('../../src/services/sync/ChromaSync.js');
+      const { ChromaMcpManager } = await import('../../src/services/sync/ChromaMcpManager.js');
+      const { ChromaUnavailableError } = await import('../../src/services/worker/search/errors.js');
       const sync = new ChromaSync(testProject);
+      // Installing uvx does not provide a running Chroma server; inject the transport failure.
+      const call = spyOn(ChromaMcpManager.getInstance(), 'callTool').mockRejectedValue(new ChromaUnavailableError('fixture connection unavailable'));
 
       const observation = {
         type: 'discovery' as const,
@@ -234,18 +233,10 @@ describe('ChromaSync Vector Sync Integration', () => {
       };
 
       try {
-        await sync.syncObservation(
-          1,
-          'session-123',
-          'test',
-          observation,
-          1,
-          Date.now()
-        );
-        // If it didn't throw, the connection might have succeeded
-      } catch (error) {
-        expect(error).toBeDefined();
-      }
+        await expect(sync.syncObservation(1, 'session-123', 'test', observation, 1, Date.now())).resolves.toBeUndefined();
+        expect(call).toHaveBeenCalledTimes(1);
+      } finally { call.mockRestore(); }
+
     });
   });
 

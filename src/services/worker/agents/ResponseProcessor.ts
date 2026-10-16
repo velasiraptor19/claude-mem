@@ -21,7 +21,7 @@ import { getWorkerPort } from '../../../shared/worker-utils.js';
 import { recordObserverFailure, recordObserverSuccess } from '../../../shared/observer-health.js';
 import { clearQuotaCooldown, routeAroundUnservableProviderIfLoaded } from '../../../shared/quota-cooldown.js';
 import { recycleObserverConversation } from '../session/recycle-conversation.js';
-import { clearRejectedOutput, recordRejectedOutput } from '../session/OutputRecovery.js';
+import { clearRejectedOutput } from '../session/OutputRecovery.js';
 import { SettingsDefaultsManager } from '../../../shared/SettingsDefaultsManager.js';
 import { USER_SETTINGS_PATH } from '../../../shared/paths.js';
 import type { ActiveSession, PendingMessage } from '../../worker-types.js';
@@ -437,7 +437,7 @@ export async function processAgentResponse(
   // success paths stamp the same value.
   const providerName =
     session.currentProvider ??
-    ({ SDK: 'claude', Gemini: 'gemini', OpenRouter: 'openrouter' } as Record<string, string>)[agentName] ??
+    ({ SDK: 'claude', Gemini: 'gemini', OpenRouter: 'openrouter', 'NVIDIA NIM': 'nvidia' } as Record<string, string>)[agentName] ??
     'claude';
 
   if (!parsed.valid) {
@@ -522,101 +522,52 @@ export async function processAgentResponse(
       return null;
     }
 
-    // Classify the non-XML output so a rejected batch is visible, not silent.
+    // Malformed output must never acknowledge and discard claimed work. Give
+    // the live stateful reducer two bounded repair passes; if those fail, keep
+    // the batch claimed and surface it to the durable-recovery integration hook.
     const outputClass = classifyObserverOutput(text);
     const preview = previewOutput(text);
-    // The overflow/quota/auth rejections returned above, so reaching here means
-    // the provider accepted this prompt and answered it. That is proof the
-    // conversation fits, whether or not the answer parsed — so the recycle
-    // counter resets here too. Resetting only on a valid parse let a generation
-    // that answered "idle" twice in a row trip the exhausted branch and wedge.
-    // An init reply does not count (#4066).
+    // The provider accepted this prompt and answered it, so context overflow is
+    // no longer consecutive even if the returned XML needs repair.
     clearDebtForAnsweredWork(session);
-    const replyDiagnostics = {
-      // An HTTP reply cut off at the output-token cap reads as xml/prose here;
-      // name it, so a truncation is not mistaken for a skip (#3868).
-      ...(finishReason ? { finishReason, truncated: finishReason === 'length' || finishReason === 'MAX_TOKENS' } : {}),
-      // Only an idle turn has a shape worth naming: blank text, thinking or
-      // tool_use blocks only, or no content blocks at all (#3454).
-      ...(outputClass === 'idle' && emptyOutputReason ? { emptyOutputReason } : {}),
-    };
-
-    // Every mode now names the <skip_summary /> sentinel, so a reply to queued
-    // work that is neither XML nor the sentinel did not answer the batch, and
-    // confirming it lost the batch silently. It earns the batch one more try,
-    // in a fresh generation (the reply stays out of the next request); a second
-    // rejection of the same batch drops it with an error, so one stubborn batch
-    // can neither loop nor stall the queue behind it. An init reply has no
-    // batch, and is confirmed as before.
-    const answersQueuedWork = session.lastGeneratorSource !== 'init' && session.claimedMessageIds.length > 0;
-    if (answersQueuedWork && recordRejectedOutput(session) === 'retry') {
-      logger.warn('PARSER', `${agentName} returned non-XML ${outputClass} response — asking for the queued batch again in a fresh generation`, {
-        sessionId: session.sessionDbId,
-        outputClass,
-        preview,
-        ...replyDiagnostics,
-      });
-      await sessionManager.resetProcessingToPending(session.sessionDbId);
-      session.abortReason = `output_retry:${outputClass}`;
-      try {
-        session.abortController.abort();
-      } catch {
-        // best-effort; AbortController.abort() should not throw in normal use.
-      }
-      worker?.broadcastProcessingStatus?.();
-      return null;
-    }
-
-    if (answersQueuedWork) {
-      clearRejectedOutput(session);
-      // A provider that answers the same batch twice without usable output is
-      // not serving it. When the fallback (by default the Anthropic plan) can
-      // take the work, hold the provider briefly and hand the batch there in a
-      // fresh generation instead of dropping it. Once there, the batch gets
-      // the same one retry; the fallback is never routed around itself.
-      const fallback = session.currentProvider
-        ? routeAroundUnservableProviderIfLoaded(
-          session.currentProvider,
-          `The observer answered a queued batch twice without observation XML (${outputClass})`,
-          'unavailable',
-          session.observerProfile,
-        )
-        : null;
+    if (session.lastGeneratorSource === 'init') return null;
+    const malformed = await sessionManager.handleMalformedOutput(session.sessionDbId, {
+      outputClass,
+      preview,
+      agentName,
+    });
+    session.consecutiveInvalidOutputs = malformed.retryCount;
+    if (malformed.retry && malformed.retryCount >= 2 && session.currentProvider) {
+      const fallback = routeAroundUnservableProviderIfLoaded(session.currentProvider,
+        `The observer answered a queued batch twice without observation XML (${outputClass})`,
+        'unavailable', session.observerProfile);
       if (fallback !== null) {
-        logger.warn('PARSER', `${agentName} returned non-XML ${outputClass} response again for the same queued batch — handing it to the ${fallback} fallback`, {
-          sessionId: session.sessionDbId,
-          outputClass,
-          preview,
-          ...replyDiagnostics,
-        });
         await sessionManager.resetProcessingToPending(session.sessionDbId);
         session.abortReason = `output_retry:${outputClass}`;
-        try {
-          session.abortController.abort();
-        } catch {
-          // best-effort; AbortController.abort() should not throw in normal use.
-        }
+        session.abortController.abort();
         worker?.broadcastProcessingStatus?.();
         return null;
       }
-      logger.error('PARSER', `${agentName} returned non-XML ${outputClass} response again for the same queued batch — dropping it`, {
-        sessionId: session.sessionDbId,
-        outputClass,
-        preview,
-        ...replyDiagnostics,
-      });
-      recordObserverFailure(providerName, `The observer answered a queued batch twice without observation XML (${outputClass}); the batch was dropped`);
-    } else {
-      logger.warn('PARSER', `${agentName} returned non-XML ${outputClass} response to a prompt with no queued batch`, {
-        sessionId: session.sessionDbId,
-        outputClass,
-        preview,
-        ...replyDiagnostics,
-        consecutiveContextOverflows: session.consecutiveContextOverflows,
+    }
+
+
+    logger.warn('PARSER', malformed.retry
+      ? `${agentName} returned non-XML ${outputClass} response — retrying queued batch with XML repair guidance`
+      : `${agentName} returned non-XML ${outputClass} response — retries exhausted; preserving batch for recovery`, {
+      sessionId: session.sessionDbId,
+      outputClass,
+      preview,
+      consecutiveContextOverflows: session.consecutiveContextOverflows,
+      ...(finishReason ? { finishReason, truncated: finishReason === 'length' || finishReason === 'MAX_TOKENS' } : {}),
+      ...(outputClass === 'idle' && emptyOutputReason ? { emptyOutputReason } : {}),
+    });
+
+    if (malformed.retry) {
+      session.conversationHistory.push({
+        role: 'user',
+        content: 'REPAIR REQUIRED: Your previous response was malformed. Return only valid XML matching the requested <observation> and/or <summary> schema. Do not include prose, Markdown fences, or explanations.',
       });
     }
-    await sessionManager.confirmClaimedMessages(session.sessionDbId);
-    session.earliestPendingTimestamp = null;
     return null;
   }
 

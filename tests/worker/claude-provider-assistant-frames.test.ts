@@ -160,7 +160,13 @@ function createHarness(session: ActiveSession) {
     createdAtEpoch: QUEUED_TIMESTAMP,
   }));
 
+  const handleMalformedOutput = mock(async () => {
+    const retry = session.claimedMessageIds.length > 0;
+    session.claimedMessageIds = [];
+    return { retry, retryCount: retry ? 1 : 0 };
+  });
   const sessionManager = {
+    handleMalformedOutput,
     confirmClaimedMessages,
     resetProcessingToPending,
     getClaimedMessages: () => claimedMessages,
@@ -179,6 +185,7 @@ function createHarness(session: ActiveSession) {
   };
 
   return {
+    handleMalformedOutput,
     confirmClaimedMessages,
     resetProcessingToPending,
     storeObservations,
@@ -241,8 +248,7 @@ describe('ClaudeProvider assistant frame dispatch (#3492)', () => {
   });
 
   // Every mode names the <skip_summary /> sentinel, so an empty or prose reply
-  // to a queued batch did not answer it: the batch is asked for again once, in
-  // a fresh generation, instead of being confirmed away.
+  // to a queued batch did not answer it: bounded XML repair retains its work.
   it('asks again for the batch when the frame carries an empty text block', async () => {
     const session = createSession();
     const harness = createHarness(session);
@@ -256,8 +262,10 @@ describe('ClaudeProvider assistant frame dispatch (#3492)', () => {
 
     expect(harness.storeObservations).not.toHaveBeenCalled();
     expect(harness.confirmClaimedMessages).not.toHaveBeenCalled();
-    expect(harness.resetProcessingToPending).toHaveBeenCalledTimes(1);
-    expect(session.abortReason).toBe('output_retry:idle');
+    expect(harness.resetProcessingToPending).not.toHaveBeenCalled();
+    expect(harness.handleMalformedOutput).toHaveBeenCalledTimes(1);
+    expect(session.conversationHistory.at(-1)?.content).toContain('REPAIR REQUIRED');
+    expect(harness.remainingClaimed()).toHaveLength(1);
   });
 
   it('asks again for the batch on idle prose', async () => {
@@ -275,8 +283,10 @@ describe('ClaudeProvider assistant frame dispatch (#3492)', () => {
 
     expect(harness.storeObservations).not.toHaveBeenCalled();
     expect(harness.confirmClaimedMessages).not.toHaveBeenCalled();
-    expect(harness.resetProcessingToPending).toHaveBeenCalledTimes(1);
-    expect(session.abortReason).toBe('output_retry:prose');
+    expect(harness.resetProcessingToPending).not.toHaveBeenCalled();
+    expect(harness.handleMalformedOutput).toHaveBeenCalledTimes(1);
+    expect(session.conversationHistory.at(-1)?.content).toContain('REPAIR REQUIRED');
+    expect(harness.remainingClaimed()).toHaveLength(1);
   });
 
   it('dispatches string content as text', async () => {
@@ -302,14 +312,13 @@ describe('ClaudeProvider assistant frame dispatch (#3492)', () => {
 
     await harness.provider.startSession(session);
 
-    // The turn said nothing at all, so the batch still gets the idle hand-off,
-    // just once and at turn granularity: it goes back to pending for one more
-    // try. Leaving it claimed would hand it to session teardown, which disposes
-    // the in-RAM buffer without a hand-off.
+    // One textless turn requests one repair without confirming the batch.
     expect(harness.storeObservations).not.toHaveBeenCalled();
     expect(harness.confirmClaimedMessages).not.toHaveBeenCalled();
-    expect(harness.resetProcessingToPending).toHaveBeenCalledTimes(1);
-    expect(session.abortReason).toBe('output_retry:idle');
+    expect(harness.resetProcessingToPending).not.toHaveBeenCalled();
+    expect(harness.handleMalformedOutput).toHaveBeenCalledTimes(1);
+    expect(session.conversationHistory.at(-1)?.content).toContain('REPAIR REQUIRED');
+    expect(harness.remainingClaimed()).toHaveLength(1);
   });
 
   // #3454: the idle hand-off names why the turn was empty — block kinds only,
@@ -370,7 +379,8 @@ describe('ClaudeProvider assistant frame dispatch (#3492)', () => {
     // Turn one stored, turn two produced no text and took the idle hand-off:
     // the flag must not stay latched from the first turn.
     expect(harness.storeObservations).toHaveBeenCalledTimes(1);
-    expect(harness.confirmClaimedMessages).toHaveBeenCalledTimes(2);
+    expect(harness.confirmClaimedMessages).toHaveBeenCalledTimes(1);
+    expect(harness.handleMalformedOutput).toHaveBeenCalledTimes(1);
   });
 
   it('re-queues the claimed batch when a textless turn ends on an SDK error (#3869)', async () => {

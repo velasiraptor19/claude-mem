@@ -266,6 +266,7 @@ describe('OpenAICompatibleProvider observer cost visibility', () => {
 
   it('reports cumulative observer tokens on the session completion line', async () => {
     const provider = new RealUsageProvider({} as any, {
+      handleMalformedOutput: async () => ({ retry: false, retryCount: 3 }),
       confirmClaimedMessages: async () => 0,
       resetProcessingToPending: async () => 0,
       getMessageIterator: async function* () {
@@ -310,6 +311,7 @@ describe('OpenAICompatibleProvider observer cost visibility', () => {
 
   it('accumulates billed usage from an empty-bodied observation response', async () => {
     const provider = new EmptyObservationUsageProvider({} as any, {
+      handleMalformedOutput: async () => ({ retry: false, retryCount: 3 }),
       confirmClaimedMessages: async () => 0,
       resetProcessingToPending: async () => 0,
       getMessageIterator: async function* () {
