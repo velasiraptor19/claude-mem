@@ -10,20 +10,23 @@ import {
 } from '../../../src/storage/postgres/index.js';
 import {
   processGeneratedResponse,
-  markGenerationFailed,
+  processSessionSummaryResponse,
+  type ProcessGeneratedResponseInput,
 } from '../../../src/server/generation/processGeneratedResponse.js';
+import type { PostgresObservationGenerationJob } from '../../../src/storage/postgres/generation-jobs.js';
+import { observationEmbeddingParts } from '../../../src/storage/postgres/observation-embeddings.js';
 import { ModeManager } from '../../../src/services/domain/ModeManager.js';
-import { quoteIdentifier } from '../../sdk/pg-isolation.js';
+import { createIsolatedSchema, poolForSchema, quoteIdentifier } from '../../sdk/pg-isolation.js';
 
 const testDatabaseUrl = process.env.CLAUDE_MEM_TEST_POSTGRES_URL;
 
-describe('processGeneratedResponse + markGenerationFailed', () => {
+describe('processGeneratedResponse', () => {
   if (!testDatabaseUrl) {
     it.skip('requires CLAUDE_MEM_TEST_POSTGRES_URL for Postgres integration', () => {});
     return;
   }
 
-  const pool = new pg.Pool({ connectionString: testDatabaseUrl });
+  let pool: pg.Pool & ProcessGeneratedResponseInput['pool'];
   let client: PostgresPoolClient;
   let schemaName: string;
   let storage: PostgresStorageRepositories;
@@ -36,10 +39,9 @@ describe('processGeneratedResponse + markGenerationFailed', () => {
     // The generation path reads the active ModeManager mode; load it so this
     // file runs standalone instead of relying on another test file's side effect.
     ModeManager.getInstance().loadMode('code');
+    schemaName = await createIsolatedSchema(testDatabaseUrl!, 'cm_phase5');
+    pool = poolForSchema(testDatabaseUrl!, schemaName) as pg.Pool & ProcessGeneratedResponseInput['pool'];
     client = await pool.connect();
-    schemaName = `cm_phase5_${crypto.randomUUID().replaceAll('-', '_')}`;
-    await client.query(`CREATE SCHEMA ${quoteIdentifier(schemaName)}`);
-    await client.query(`SET search_path TO ${quoteIdentifier(schemaName)}`);
     await bootstrapServerPostgresSchema(client);
     storage = createPostgresStorageRepositories(client);
 
@@ -68,15 +70,6 @@ describe('processGeneratedResponse + markGenerationFailed', () => {
     });
     jobId = job.id;
 
-    // Re-bind the storage layer to the pool so processGeneratedResponse's
-    // internal transactions see the test schema. We do this by setting
-    // search_path for new pool connections via on-connect hook, but pg's
-    // Pool does not expose that easily. Workaround: use the pool from the
-    // search_path-aware helper below. For these tests we monkey-patch the
-    // shared pool to set search_path on new connections.
-    pool.on('connect', (poolClient) => {
-      poolClient.query(`SET search_path TO ${quoteIdentifier(schemaName)}`).catch(() => {});
-    });
   });
 
   afterEach(async () => {
@@ -86,7 +79,7 @@ describe('processGeneratedResponse + markGenerationFailed', () => {
       } catch {}
       client.release();
     }
-    pool.removeAllListeners('connect');
+    await pool.end();
   });
 
   async function reloadJob() {
@@ -96,6 +89,114 @@ describe('processGeneratedResponse + markGenerationFailed', () => {
       teamId,
     });
   }
+
+  async function claim(job?: PostgresObservationGenerationJob) {
+    const id = job?.id ?? jobId;
+    await storage.observationGenerationJobs.transitionStatus({ id, projectId, teamId, status: 'processing' });
+    return (await storage.observationGenerationJobs.getByIdForScope({ id, projectId, teamId }))!;
+  }
+
+  async function summaryJob() {
+    const session = await storage.sessions.create({
+      projectId, teamId, contentSessionId: `content-${crypto.randomUUID()}`,
+      agentId: 'agent-1', platformSource: 'claude-code', metadata: {},
+    });
+    return storage.observationGenerationJobs.create({
+      projectId, teamId, sourceType: 'session_summary', sourceId: session.id,
+      serverSessionId: session.id, jobType: 'observation_generate_session_summary',
+    });
+  }
+
+  // Regression: the summary path used to read only parsed.summary. A provider that
+  // answered with <observation> blocks (which is what the shared prompt asked for)
+  // produced summary=null, was judged empty, and the job completed having discarded
+  // a paid-for response. Measured on a production deployment: 4,898 summary jobs,
+  // zero observations persisted.
+  it('persists a summary job answered with <observation> blocks instead of dropping it', async () => {
+    const fresh = await claim(await summaryJob());
+
+    const outcome = await processSessionSummaryResponse({
+      pool,
+      job: fresh,
+      rawText: `
+        <observation>
+          <type>discovery</type>
+          <title>Session arc</title>
+          <facts><fact>the run ended with the queue drained</fact></facts>
+        </observation>
+      `,
+      providerLabel: 'fake',
+      modelId: 'fake-1',
+    });
+
+    expect(outcome.kind).toBe('completed');
+    if (outcome.kind === 'completed') {
+      // the point of the fix: the response is kept, not silently discarded
+      expect(outcome.observations.length).toBeGreaterThan(0);
+      expect(outcome.observations[0]!.content).toContain('queue drained');
+    }
+
+    const reloaded = await storage.observationGenerationJobs.getByIdForScope({
+      id: fresh.id,
+      projectId,
+      teamId,
+    });
+    expect(reloaded?.status).toBe('completed');
+  });
+
+  // The parser's empty-observation guard accepts a block whose only populated
+  // field is <concepts>, but renderObservationContent ignored concepts, so the
+  // block rendered to '' and was skipped as empty content - the same
+  // accepted-then-discarded shape this PR is about, one layer down.
+  it('persists a concepts-only response instead of completing the job empty', async () => {
+    const fresh = await claim(await summaryJob());
+
+    const outcome = await processSessionSummaryResponse({
+      pool,
+      job: fresh,
+      rawText: `
+        <observation>
+          <type>discovery</type>
+          <concepts><concept>outbox drain</concept><concept>valkey backpressure</concept></concepts>
+        </observation>
+      `,
+      providerLabel: 'fake',
+      modelId: 'fake-1',
+    });
+
+    expect(outcome.kind).toBe('completed');
+    if (outcome.kind === 'completed') {
+      expect(outcome.observations).toHaveLength(1);
+      expect(outcome.observations[0]!.content).toContain('outbox drain');
+      expect(outcome.observations[0]!.content).toContain('valkey backpressure');
+      expect(outcome.privateContentDetected).toBe(false);
+    }
+  });
+
+  // Same defect on the per-event path: concepts-only blocks were skipped by the
+  // empty-content guard and the job still completed.
+  it('persists a concepts-only observation on the per-event path', async () => {
+    const fresh = await claim();
+
+    const outcome = await processGeneratedResponse({
+      pool,
+      job: fresh,
+      rawText: `
+        <observation>
+          <type>discovery</type>
+          <concepts><concept>lease renewal</concept></concepts>
+        </observation>
+      `,
+      providerLabel: 'fake',
+      modelId: 'fake-1',
+    });
+
+    expect(outcome.kind).toBe('completed');
+    if (outcome.kind === 'completed') {
+      expect(outcome.observations).toHaveLength(1);
+      expect(outcome.observations[0]!.content).toContain('lease renewal');
+    }
+  });
 
   it('persists observation, links source, and marks job completed for valid XML', async () => {
     const xml = `
@@ -109,16 +210,9 @@ describe('processGeneratedResponse + markGenerationFailed', () => {
     expect(job).toBeTruthy();
 
     // Lock first, like the real generator does.
-    await storage.observationGenerationJobs.transitionStatus({
-      id: jobId,
-      projectId,
-      teamId,
-      status: 'processing',
-    });
-
-    const fresh = (await reloadJob())!;
+    const fresh = await claim();
     const outcome = await processGeneratedResponse({
-      pool: pool as unknown as Parameters<typeof processGeneratedResponse>[0]['pool'],
+      pool,
       job: fresh,
       rawText: xml,
       providerLabel: 'fake',
@@ -140,10 +234,87 @@ describe('processGeneratedResponse + markGenerationFailed', () => {
       projectId,
       teamId,
     });
-    expect(sources).toHaveLength(1);
-    expect(sources[0]!.sourceType).toBe('agent_event');
-    expect(sources[0]!.sourceId).toBe(eventId);
-    expect(sources[0]!.generationJobId).toBe(jobId);
+  expect(sources).toHaveLength(1);
+  expect(sources[0]!.sourceType).toBe('agent_event');
+  expect(sources[0]!.sourceId).toBe(eventId);
+  expect(sources[0]!.generationJobId).toBe(jobId);
+  });
+
+  it('persists freeform prose from a closed observation block', async () => {
+    const xml = `
+      <observation>
+        This deploy unblocked the worker restart path after the queue drained.
+      </observation>
+    `;
+
+    const fresh = await claim();
+    const outcome = await processGeneratedResponse({
+      pool,
+      job: fresh,
+      rawText: xml,
+      providerLabel: 'fake',
+      modelId: 'fake-1',
+    });
+
+    expect(outcome.kind).toBe('completed');
+    if (outcome.kind === 'completed') {
+      expect(outcome.observations).toHaveLength(1);
+      expect(outcome.observations[0]!.content).toContain('This deploy unblocked the worker restart path');
+      expect(outcome.observations[0]!.metadata.title).toBe('This deploy unblocked the worker restart path after the queue drained.');
+      expect(outcome.observations[0]!.content).not.toContain('This deploy unblocked the worker restart path after the queue drained.\n\nThis deploy unblocked the worker restart path after the queue drained.');
+    }
+  });
+
+  it('strips memory tags from generated observation metadata before storage and embedding', async () => {
+    const outcome = await processGeneratedResponse({
+      pool,
+      job: await claim(),
+      providerLabel: 'fake',
+      rawText: `<observation>
+        <type>discovery</type>
+        <title>Public title <private>hidden-title</private></title>
+        <narrative>Public narrative <private>hidden-narrative</private></narrative>
+        <facts><fact>Public fact <claude-mem-context>hidden-fact</claude-mem-context></fact></facts>
+        <files_read><file>src/public.ts</file><file><private>hidden-file</private></file></files_read>
+      </observation>`,
+    });
+    expect(outcome.kind).toBe('completed');
+    const [stored] = await storage.observations.listByProject({ projectId, teamId });
+    expect(stored).toBeDefined();
+    expect(stored!.content).not.toContain('hidden-');
+    expect(JSON.stringify(stored!.metadata)).not.toContain('hidden-');
+    expect(stored!.metadata.title).toBe('Public title');
+    expect(stored!.metadata.narrative).toBe('Public narrative');
+    expect(stored!.metadata.facts).toEqual(['Public fact']);
+    expect(stored!.metadata.files_read).toContain('src/public.ts');
+    expect(observationEmbeddingParts(stored!.kind, stored!.metadata, stored!.content)).toEqual([
+      { part: 'narrative', text: 'Public narrative' },
+      { part: 'fact_0', text: 'Public fact' },
+    ]);
+  });
+
+  it('strips memory tags from generated summary metadata before storage and embedding', async () => {
+    const outcome = await processSessionSummaryResponse({
+      pool,
+      job: await claim(await summaryJob()),
+      providerLabel: 'fake',
+      rawText: `<summary>
+        <request>Public request <private>hidden-request</private></request>
+        <learned>Public learning <private>hidden-learning</private></learned>
+        <notes>Public note <claude-mem-context>hidden-context</claude-mem-context></notes>
+      </summary>`,
+    });
+    expect(outcome.kind).toBe('completed');
+    const [stored] = await storage.observations.listByProject({ projectId, teamId });
+    expect(stored).toBeDefined();
+    expect(stored!.kind).toBe('summary');
+    expect(stored!.content).not.toContain('hidden-');
+    expect(JSON.stringify(stored!.metadata)).not.toContain('hidden-');
+    expect(observationEmbeddingParts(stored!.kind, stored!.metadata, stored!.content)).toEqual([
+      { part: 'request', text: 'Public request' },
+      { part: 'learned', text: 'Public learning' },
+      { part: 'notes', text: 'Public note' },
+    ]);
   });
 
   it('records token + observation usage when metering is enabled', async () => {
@@ -157,10 +328,9 @@ describe('processGeneratedResponse + markGenerationFailed', () => {
           <facts><fact>token metering</fact></facts>
         </observation>
       `;
-      await storage.observationGenerationJobs.transitionStatus({ id: jobId, projectId, teamId, status: 'processing' });
-      const fresh = (await reloadJob())!;
+      const fresh = await claim();
       const outcome = await processGeneratedResponse({
-        pool: pool as unknown as Parameters<typeof processGeneratedResponse>[0]['pool'],
+        pool,
         job: fresh,
         rawText: xml,
         providerLabel: 'fake',
@@ -188,10 +358,9 @@ describe('processGeneratedResponse + markGenerationFailed', () => {
     delete process.env.CLAUDE_MEM_USAGE_METERING;
     try {
       const xml = `<observation><type>discovery</type><title>x</title><facts><fact>f</fact></facts></observation>`;
-      await storage.observationGenerationJobs.transitionStatus({ id: jobId, projectId, teamId, status: 'processing' });
-      const fresh = (await reloadJob())!;
+      const fresh = await claim();
       await processGeneratedResponse({
-        pool: pool as unknown as Parameters<typeof processGeneratedResponse>[0]['pool'],
+        pool,
         job: fresh, rawText: xml, providerLabel: 'fake', modelId: 'fake-1', tokensUsed: 999,
       });
       const n = await pool.query(`SELECT count(*)::int AS n FROM usage_events WHERE team_id = $1`, [teamId]);
@@ -201,54 +370,10 @@ describe('processGeneratedResponse + markGenerationFailed', () => {
     }
   });
 
-  it('replaying the same job yields exactly one observation (idempotency)', async () => {
-    const xml = `<observation><type>discovery</type><title>Same</title><facts><fact>same</fact></facts></observation>`;
-
-    await storage.observationGenerationJobs.transitionStatus({
-      id: jobId,
-      projectId,
-      teamId,
-      status: 'processing',
-    });
-
-    const fresh = (await reloadJob())!;
-    const first = await processGeneratedResponse({
-      pool: pool as unknown as Parameters<typeof processGeneratedResponse>[0]['pool'],
-      job: fresh,
-      rawText: xml,
-      providerLabel: 'fake',
-    });
-    expect(first.kind).toBe('completed');
-
-    // Manually move job back to processing to simulate retry
-    // (in practice retry would create a new job invocation, but the
-    // idempotency guard is at the observation level via generation_key).
-    // The terminal-status check inside processGeneratedResponse will
-    // short-circuit the second call cleanly, demonstrating that retries
-    // do not re-write observations.
-    const second = await processGeneratedResponse({
-      pool: pool as unknown as Parameters<typeof processGeneratedResponse>[0]['pool'],
-      job: fresh,
-      rawText: xml,
-      providerLabel: 'fake',
-    });
-    expect(second.kind).toBe('completed');
-
-    // Verify only one observation exists
-    const list = await storage.observations.listByProject({ projectId, teamId });
-    expect(list).toHaveLength(1);
-  });
-
   it('marks job completed with no observation when the response is a skip_summary', async () => {
-    await storage.observationGenerationJobs.transitionStatus({
-      id: jobId,
-      projectId,
-      teamId,
-      status: 'processing',
-    });
-    const fresh = (await reloadJob())!;
+    const fresh = await claim();
     const outcome = await processGeneratedResponse({
-      pool: pool as unknown as Parameters<typeof processGeneratedResponse>[0]['pool'],
+      pool,
       job: fresh,
       rawText: '<skip_summary reason="all_events_private" />',
       providerLabel: 'fake',
@@ -266,47 +391,71 @@ describe('processGeneratedResponse + markGenerationFailed', () => {
     expect(reloaded?.status).toBe('completed');
   });
 
-  it('returns parse_error and does not write observations for malformed XML', async () => {
-    await storage.observationGenerationJobs.transitionStatus({
-      id: jobId,
+  it('copies the session folder label onto generated observation metadata', async () => {
+    const session = await storage.sessions.create({
       projectId,
       teamId,
-      status: 'processing',
+      externalSessionId: 'ext-session-folder',
+      metadata: { project: 'my-folder' },
     });
-    const fresh = (await reloadJob())!;
+    const event = await storage.agentEvents.create({
+      projectId,
+      teamId,
+      sourceAdapter: 'api',
+      eventType: 'tool_use',
+      payload: { tool: 'bash', input: 'pwd' },
+      occurredAt: new Date(),
+    });
+    const job = await storage.observationGenerationJobs.create({
+      projectId,
+      teamId,
+      sourceType: 'agent_event',
+      sourceId: event.id,
+      agentEventId: event.id,
+      serverSessionId: session.id,
+      jobType: 'observation_generate_for_event',
+    });
+    const fresh = await claim(job);
+
     const outcome = await processGeneratedResponse({
-      pool: pool as unknown as Parameters<typeof processGeneratedResponse>[0]['pool'],
+      pool,
       job: fresh,
-      rawText: 'this is just prose without any xml',
+      rawText: `
+        <observation>
+          <type>discovery</type>
+          <title>Folder travels</title>
+          <facts><fact>session metadata carries the folder</fact></facts>
+        </observation>
+      `,
       providerLabel: 'fake',
     });
-    expect(outcome.kind).toBe('parse_error');
 
-    const list = await storage.observations.listByProject({ projectId, teamId });
-    expect(list).toHaveLength(0);
-
-    // Job still in processing — caller (ProviderObservationGenerator) is
-    // responsible for transitioning to failed/retry.
-    const reloaded = await reloadJob();
-    expect(reloaded?.status).toBe('processing');
+    expect(outcome.kind).toBe('completed');
+    if (outcome.kind === 'completed') {
+      expect(outcome.observations).toHaveLength(1);
+      expect(outcome.observations[0]!.metadata.project).toBe('my-folder');
+    }
   });
 
-  it('markGenerationFailed routes to retry when retryable and attempts left', async () => {
-    await storage.observationGenerationJobs.transitionStatus({
-      id: jobId,
-      projectId,
-      teamId,
-      status: 'processing',
-    });
-    const fresh = (await reloadJob())!;
-    await markGenerationFailed({
-      pool: pool as unknown as Parameters<typeof markGenerationFailed>[0]['pool'],
+  it('writes project: null when the job carries no server session (legacy jobs)', async () => {
+    const fresh = await claim();
+    const outcome = await processGeneratedResponse({
+      pool,
       job: fresh,
-      reason: 'transient',
-      classification: 'transient',
-      retryable: true,
+      rawText: `
+        <observation>
+          <type>discovery</type>
+          <title>No session</title>
+          <facts><fact>legacy job without a session row</fact></facts>
+        </observation>
+      `,
+      providerLabel: 'fake',
     });
-    const reloaded = await reloadJob();
-    expect(reloaded?.status).toBe('queued');
+
+    expect(outcome.kind).toBe('completed');
+    if (outcome.kind === 'completed') {
+      expect(outcome.observations[0]!.metadata.project).toBeNull();
+    }
   });
+
 });

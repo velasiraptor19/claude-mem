@@ -123,10 +123,13 @@ function expectLauncherPrefixBeforeMode(args: string[], mode: 'http' | 'persiste
   expect(args[fromIdx + 2]).toBe('chroma-mcp');
   expect(args[fromIdx + 3]).toBe('--client-type');
   expect(args[fromIdx + 4]).toBe(mode);
+  expect(args.filter(arg => arg === 'chromadb==1.5.9')).toHaveLength(1);
   expect(args.slice(0, fromIdx)).toEqual([
     '--python', '3.13',
     '--with', 'onnxruntime>=1.20',
     '--with', 'protobuf<7',
+    '--with', 'chromadb==1.5.9',
+    '--with', 'pydantic<2.14',
   ]);
 }
 
@@ -180,4 +183,5 @@ describe('ChromaMcpManager SSL flag regression (#1286)', () => {
     expect(args).toContain('--client-type');
     expect(args[args.indexOf('--client-type') + 1]).toBe('persistent');
   });
+
 });

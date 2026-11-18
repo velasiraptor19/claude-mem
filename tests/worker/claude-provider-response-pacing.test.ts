@@ -1,0 +1,632 @@
+import { describe, it, expect, beforeEach, afterEach, afterAll, spyOn } from 'bun:test';
+import { installScriptedClaudeSdk, createScriptedSession, type FakeSdk, settle, withTimeout } from '../fixtures/worker/scripted-claude-sdk.js';
+import type { ActiveSession } from '../../src/services/worker-types.js';
+import { sessionDbWithoutMedia } from '../fixtures/worker/session-db-without-media.js';
+import { LIVE_OBSERVER_MAX_SESSION_MESSAGES } from '../../src/shared/observer-work-policy.js';
+
+/** The largest backlog the live buffer accepts for one session. */
+const FULL_BUFFER = LIVE_OBSERVER_MAX_SESSION_MESSAGES;
+
+// #4066: the Claude feed claimed and yielded a whole backlog before the model
+// answered anything, so the generation budget tripped on unanswered prompts and
+// every recycle re-claimed the same oldest batch. These tests drive the real
+// ClaudeProvider, SessionManager and SessionMessageBuffer against a fake SDK that
+// pulls the prompt stream EAGERLY — the way the real one does — so an unpaced
+// feed shows up as a burst instead of hiding behind a lazy consumer.
+
+// bun's mock.module is process-global and sticky; snapshot each real module and
+// restore it in afterAll so later suites keep the real implementations.
+const sdkFixture = installScriptedClaudeSdk({ eager: true, endOnInputDone: true, untilTimeoutMs: 10_000 });
+const { sdk, sdkStarted } = sdkFixture;
+afterAll(() => {
+  sdkFixture.restore();
+});
+
+const { ClaudeProvider } = await import('../../src/services/worker/ClaudeProvider.js');
+const { SessionManager } = await import('../../src/services/worker/SessionManager.js');
+const {
+  ObserverResponsePacer,
+} = await import('../../src/services/worker/session/response-pacer.js');
+const { MAX_CONSECUTIVE_RECYCLES } = await import('../../src/services/worker/session/recycle-conversation.js');
+const { SettingsDefaultsManager } = await import('../../src/shared/SettingsDefaultsManager.js');
+
+const SESSION_ID = 4066;
+// The sanctioned no-op answer: every mode names this sentinel, and prose in
+// reply to queued work is asked for again (#3624).
+const SKIP_REPLY = '<skip_summary reason="noise" />';
+
+function createSession(): ActiveSession {
+  return createScriptedSession(SESSION_ID, {
+    userPrompt: 'work through the backlog', currentProvider: 'claude', consecutiveContextOverflows: 0,
+  });
+}
+
+function createHarness(backlog: number, payloadChars = 200) {
+  const storedObservations: unknown[][] = [];
+  const dbManager = {
+    getSessionById: () => ({ project: 'observer-project', memory_session_id: null }),
+    getSessionStore: () => ({
+      db: sessionDbWithoutMedia(), ensureMemorySessionIdRegistered: (_id: number, memoryId: string) => memoryId,
+      updateMemorySessionId: () => {},
+      storeObservations: (_memoryId: string, _project: string, observations: unknown[]) => {
+        storedObservations.push(observations);
+        return { observationIds: [storedObservations.length], summaryId: null, createdAtEpoch: Date.now() };
+      },
+      linkToolUsesToObservation: () => 0,
+      markCommittedToolUses: () => {},
+    }),
+    getChromaSync: () => null,
+    getCloudSync: () => null,
+  };
+  const sessionManager = new SessionManager(dbManager as never);
+  const session = createSession();
+  (sessionManager as any).sessions.set(SESSION_ID, session);
+
+  const buffer = sessionManager.getMessageBuffer();
+  for (let i = 0; i < backlog; i++) {
+    const id = buffer.enqueue(SESSION_ID, {
+      type: 'observation',
+      tool_name: 'Bash',
+      tool_input: { command: `step ${i}` },
+      tool_response: `${i}:`.padEnd(payloadChars, 'x'),
+      prompt_number: 2,
+      toolUseId: `toolu_${i}`,
+    });
+    // The live buffer is capped; a harness larger than the cap would silently shrink.
+    if (id === 0) throw new Error(`backlog ${backlog} exceeds the live buffer cap at message ${i}`);
+  }
+
+  const provider = new ClaudeProvider(dbManager as never, sessionManager as never);
+  return {
+    session,
+    sessionManager,
+    provider,
+    storedObservations,
+    pending: () => buffer.getPendingCount(SESSION_ID),
+  };
+}
+
+let liveSessions: ActiveSession[] = [];
+let previousObserveBarePrompts: string | undefined;
+
+beforeEach(() => {
+  sdkFixture.currentSdk = null;
+  liveSessions = [];
+  // These tests pace the generator's separate init turn; the default, where
+  // the init prompt rides on the first observation, has its own describe below.
+  previousObserveBarePrompts = process.env.CLAUDE_MEM_OBSERVE_BARE_PROMPTS;
+  process.env.CLAUDE_MEM_OBSERVE_BARE_PROMPTS = 'true';
+});
+
+afterEach(() => {
+  // Release any generator still parked on the pacer so nothing outlives the test.
+  for (const session of liveSessions) session.abortController.abort();
+  if (previousObserveBarePrompts === undefined) delete process.env.CLAUDE_MEM_OBSERVE_BARE_PROMPTS;
+  else process.env.CLAUDE_MEM_OBSERVE_BARE_PROMPTS = previousObserveBarePrompts;
+});
+
+describe('Claude observer feed pacing without a separate init turn (the default)', () => {
+  it('sends the init prompt with the first observation and still holds every claim until it is answered', async () => {
+    process.env.CLAUDE_MEM_OBSERVE_BARE_PROMPTS = 'false';
+    const h = createHarness(FULL_BUFFER);
+    liveSessions.push(h.session);
+    const run = h.provider.startSession(h.session);
+    await sdkStarted();
+
+    await sdk().until(() => sdk().prompts.length >= 1, 'first prompt');
+    await settle();
+    // One prompt out: the user's request and the first observation together.
+    expect(sdk().prompts.length).toBe(1);
+    expect(sdk().prompts[0]).toContain('<user_request>work through the backlog</user_request>');
+    expect(sdk().prompts[0]).toContain('step 0');
+    expect(h.session.claimedMessageIds.length).toBe(1);
+
+    for (let turn = 1; turn <= 3; turn++) {
+      sdk().answer(SKIP_REPLY);
+      await sdk().until(() => sdk().prompts.length >= turn + 1, `prompt ${turn + 1}`);
+      await settle();
+      expect(sdk().prompts.length).toBe(turn + 1);
+      expect(sdk().prompts[turn]).not.toContain('<user_request>');
+      expect(sdk().prompts[turn]).toContain(`step ${turn}`);
+      expect(h.session.claimedMessageIds.length).toBe(1);
+      expect(h.pending()).toBe(FULL_BUFFER - turn);
+    }
+
+    h.session.abortController.abort();
+    await withTimeout(run, 'startSession after abort');
+  });
+});
+
+// #5023: at the shipped 100000-char budget, a pasted prompt larger than the
+// budget used to fill the fresh generation's framing prompt on its own, so the
+// generation recycled before its first observation, again and again, until the
+// session paused. The request is now bounded like one tool field.
+describe('a long pasted prompt at the shipped generation budget (#5023)', () => {
+  it('sends the first observation instead of recycling on the framing prompt', async () => {
+    process.env.CLAUDE_MEM_OBSERVE_BARE_PROMPTS = 'false';
+    const settings = spyOn(SettingsDefaultsManager, 'loadFromFile').mockImplementation(() => SettingsDefaultsManager.getAllDefaults());
+    try {
+      expect(SettingsDefaultsManager.getAllDefaults().CLAUDE_MEM_OBSERVER_MAX_CONVERSATION_CHARS).toBe('100000');
+      const h = createHarness(3);
+      h.session.userPrompt = 'HEAD_SENTINEL' + 'p'.repeat(120_000) + 'TAIL_SENTINEL';
+      liveSessions.push(h.session);
+      let ended = false;
+      const run = h.provider.startSession(h.session).finally(() => { ended = true; });
+      await sdkStarted();
+
+      await sdk().until(() => sdk().prompts.length >= 1 || ended, 'first prompt or generation end');
+      await settle();
+      expect(sdk().prompts.length).toBe(1);
+      expect(sdk().prompts[0]).toContain('step 0');
+      expect(sdk().prompts[0]).toContain('HEAD_SENTINEL');
+      expect(sdk().prompts[0]).toContain('TAIL_SENTINEL');
+      expect(sdk().prompts[0].length).toBeLessThan(100_000);
+      expect(h.session.consecutiveContextOverflows).toBe(0);
+      expect(h.session.abortReason ?? null).toBeNull();
+      expect(h.session.overflowPausedUntilMs).toBeUndefined();
+
+      h.session.abortController.abort();
+      await withTimeout(run, 'startSession after abort');
+    } finally {
+      settings.mockRestore();
+    }
+  });
+});
+
+describe('Claude observer feed pacing (#4066)', () => {
+  it('holds every claim until the previous prompt has been answered', async () => {
+    const h = createHarness(FULL_BUFFER);
+    liveSessions.push(h.session);
+    const run = h.provider.startSession(h.session);
+    await sdkStarted();
+
+    await sdk().until(() => sdk().prompts.length >= 1, 'init prompt');
+    await settle();
+    // Only the init prompt is out; the backlog is untouched.
+    expect(sdk().prompts.length).toBe(1);
+    expect(h.session.claimedMessageIds.length).toBe(0);
+    expect(h.pending()).toBe(FULL_BUFFER);
+
+    for (let turn = 1; turn <= 5; turn++) {
+      sdk().answer(SKIP_REPLY);
+      await sdk().until(() => sdk().prompts.length >= turn + 1, `prompt ${turn + 1}`);
+      await settle();
+      // Exactly one more message claimed and sent per answered turn.
+      expect(sdk().prompts.length).toBe(turn + 1);
+      expect(h.session.claimedMessageIds.length).toBe(1);
+      // Each answered observation turn confirmed exactly its own message.
+      expect(h.pending()).toBe(FULL_BUFFER - (turn - 1));
+    }
+
+    h.session.abortController.abort();
+    await withTimeout(run, 'startSession after abort');
+  });
+
+  it('a backlog far over the budget makes progress instead of recycling on an unanswered burst', async () => {
+    // A full buffer (128) x ~2k chars is ~256k chars of prompts — over twice the 100k default budget,
+    // yet each generation still holds about 40 answered turns.
+    const h = createHarness(FULL_BUFFER, 2_000);
+    liveSessions.push(h.session);
+    const recycleLog: Array<{ answeredTurns: number; claimed: number; history: number }> = [];
+
+    let answeredTurns = 0;
+    const runGeneration = async () => {
+      const previous = sdkFixture.currentSdk;
+      const run = h.provider.startSession(h.session);
+      await sdkStarted(previous);
+      await sdk().until(() => sdk().prompts.length >= 1, 'init prompt');
+      let sent = 1;
+      let answeredThisGeneration = 0;
+      while (true) {
+        sdk().answer(SKIP_REPLY);
+        answeredTurns += 1;
+        answeredThisGeneration += 1;
+        await sdk().until(
+          () => sdk().prompts.length > sent || h.session.abortController.signal.aborted || sdk().inputFinished,
+          `prompt ${sent + 1}`,
+        );
+        if (sdk().prompts.length > sent) {
+          sent = sdk().prompts.length;
+          // Never more than one unanswered prompt in flight.
+          expect(sent).toBe(answeredThisGeneration + 1);
+          continue;
+        }
+        break;
+      }
+      recycleLog.push({
+        answeredTurns,
+        claimed: h.session.claimedMessageIds.length,
+        history: h.session.conversationHistory.length,
+      });
+      await withTimeout(run, 'generation end');
+    };
+
+    await runGeneration();
+    const pendingAfterFirst = h.pending();
+
+    // The budget did fire — but only after many answered turns, never on a burst.
+    expect(h.session.forceInit).toBe(true);
+    expect(recycleLog[0].answeredTurns).toBeGreaterThan(20);
+    // Everything answered was confirmed; only unanswered work stays pending.
+    expect(pendingAfterFirst).toBeLessThan(FULL_BUFFER - 20);
+    expect(h.session.overflowPausedUntilMs).toBeUndefined();
+
+    // A fresh generation continues from where the last stopped rather than
+    // re-claiming the same oldest batch.
+    h.session.abortController = new AbortController();
+    h.session.abortReason = null;
+    const turnsBefore = answeredTurns;
+    await runGeneration();
+    expect(answeredTurns - turnsBefore).toBeGreaterThan(20);
+    expect(h.pending()).toBeLessThan(pendingAfterFirst - 20);
+    // Answered turns reset the recycle counter, so it never reaches the
+    // exhausted pause that wedged #4066.
+    expect(h.session.consecutiveContextOverflows).toBeLessThanOrEqual(1);
+    expect(h.session.overflowPausedUntilMs).toBeUndefined();
+  });
+
+  it('an abort while waiting for an answer ends the generator and keeps the claimed message', async () => {
+    const h = createHarness(5);
+    liveSessions.push(h.session);
+    const generator = (h.provider as any).createMessageGenerator(
+      h.session,
+      { lastCwd: undefined },
+      { current: null },
+      undefined,
+      undefined,
+      new ObserverResponsePacer(),
+    ) as AsyncIterableIterator<{ message: { content: string } }>;
+
+    const init = await withTimeout(generator.next(), 'init prompt');
+    expect(init.done).toBe(false);
+
+    // Parked on the pacer: nothing answers the init prompt.
+    const parked = generator.next();
+    await settle();
+    expect(h.session.claimedMessageIds.length).toBe(0);
+
+    h.session.abortController.abort();
+    const ended = await withTimeout(parked, 'generator after abort', 5_000);
+    expect(ended.done).toBe(true);
+    expect(h.pending()).toBe(5);
+  });
+
+  it('an abort mid-generation leaves the claimed message pending for the next generation', async () => {
+    const h = createHarness(5);
+    liveSessions.push(h.session);
+    const run = h.provider.startSession(h.session);
+    await sdkStarted();
+
+    await sdk().until(() => sdk().prompts.length >= 1, 'init prompt');
+    sdk().answer(SKIP_REPLY);
+    await sdk().until(() => sdk().prompts.length >= 2, 'first observation');
+    const claimedId = h.session.claimedMessageIds[0];
+    expect(claimedId).toBeDefined();
+
+    h.session.abortController.abort();
+    await withTimeout(run, 'startSession after abort', 1_000);
+    expect(h.pending()).toBe(5);
+
+    // The next generation re-yields the same message rather than losing it.
+    h.session.abortController = new AbortController();
+    liveSessions.push(h.session);
+    const iterator = h.sessionManager.getMessageIterator(SESSION_ID);
+    const next = await withTimeout(iterator.next(), 'reclaim');
+    expect(next.value?._persistentId).toBe(claimedId);
+    h.session.abortController.abort();
+    await iterator.return?.(undefined);
+  });
+
+  it('a restart does not let the init reply confirm a claim left by the previous generation', async () => {
+    const h = createHarness(5);
+    liveSessions.push(h.session);
+
+    // A previous generation claimed a message and ended without resetting it,
+    // the way the quota-guard break does.
+    const stale = h.sessionManager.getMessageIterator(SESSION_ID);
+    const claimed = await withTimeout(stale.next(), 'stale claim');
+    await stale.return?.(undefined);
+    const staleId = claimed.value!._persistentId;
+    expect(h.session.claimedMessageIds).toEqual([staleId]);
+
+    const run = h.provider.startSession(h.session);
+    await sdkStarted();
+    await sdk().until(() => sdk().prompts.length >= 1, 'init prompt');
+    sdk().answer(SKIP_REPLY);
+    await sdk().until(() => sdk().prompts.length >= 2, 'first observation');
+
+    // Still in the buffer, and re-sent as the first observation.
+    expect(h.pending()).toBe(5);
+    expect(sdk().prompts[1]).toContain('step 0');
+    expect(h.session.claimedMessageIds).toEqual([staleId]);
+
+    h.session.abortController.abort();
+    await withTimeout(run, 'startSession after abort');
+  });
+
+  it('init replies do not clear the overflow debt, so a budget too small for one observation reaches the exhausted pause', async () => {
+    const h = createHarness(5);
+    liveSessions.push(h.session);
+    // Smaller than the init prompt plus one observation.
+    (h.provider as any).conversationMaxChars = () => 10;
+
+    let previous: FakeSdk | null = null;
+    for (let generation = 1; generation <= MAX_CONSECUTIVE_RECYCLES + 1; generation++) {
+      h.session.abortController = new AbortController();
+      h.session.abortReason = null;
+      const run = h.provider.startSession(h.session);
+      previous = await sdkStarted(previous);
+      await sdk().until(() => sdk().prompts.length >= 1, `init prompt ${generation}`);
+      sdk().answer(SKIP_REPLY);
+      await withTimeout(run, `generation ${generation}`);
+      // The init reply was accepted, yet the debt keeps counting.
+      expect(h.session.consecutiveContextOverflows).toBe(generation);
+      expect(sdk().prompts.length).toBe(1);
+    }
+
+    expect(h.session.consecutiveContextOverflows).toBeGreaterThan(MAX_CONSECUTIVE_RECYCLES);
+    expect(h.session.abortReason).toBe('overflow:exhausted');
+    expect(h.session.overflowPausedUntilMs).toBeGreaterThan(Date.now());
+    expect(h.pending()).toBe(5);
+  });
+
+  it('only a reply to queued work clears the overflow, stall, and rate-limit debts', async () => {
+    const h = createHarness(3);
+    liveSessions.push(h.session);
+    h.session.consecutiveContextOverflows = 1;
+    h.session.consecutiveResponseStalls = 2;
+    h.session.consecutiveSdkStreamExits = 2;
+    h.session.consecutiveRateLimitResumes = 3;
+
+    const run = h.provider.startSession(h.session);
+    await sdkStarted();
+    await sdk().until(() => sdk().prompts.length >= 1, 'init prompt');
+    sdk().answer(SKIP_REPLY);
+    await sdk().until(() => sdk().prompts.length >= 2, 'first observation');
+    expect(h.session.consecutiveContextOverflows).toBe(1);
+    expect(h.session.consecutiveResponseStalls).toBe(2);
+    expect(h.session.consecutiveSdkStreamExits).toBe(2);
+    expect(h.session.consecutiveRateLimitResumes).toBe(3);
+
+    sdk().answer(SKIP_REPLY);
+    await sdk().until(() => sdk().prompts.length >= 3, 'second observation');
+    expect(h.session.consecutiveContextOverflows).toBe(0);
+    expect(h.session.consecutiveResponseStalls).toBe(0);
+    expect(h.session.consecutiveSdkStreamExits).toBe(0);
+    expect(h.session.consecutiveRateLimitResumes).toBe(0);
+
+    h.session.abortController.abort();
+    await withTimeout(run, 'startSession after abort');
+  });
+  it('a reply that lands after a response stall is dropped, so the re-sent message is not stored twice', async () => {
+    const h = createHarness(2);
+    liveSessions.push(h.session);
+    (h.provider as any).responseStallMs = () => 50;
+    const run = h.provider.startSession(h.session);
+    await sdkStarted();
+
+    await sdk().until(() => sdk().prompts.length >= 1, 'init prompt');
+    sdk().answer(SKIP_REPLY);
+    await sdk().until(() => sdk().prompts.length >= 2, 'first observation');
+    expect(h.session.claimedMessageIds.length).toBe(1);
+
+    // The answer is already in the stream when the stall fires; the stall's own
+    // abort is what flushes it out. Processing it would confirm or store a turn
+    // whose claim the stall just handed back for re-sending.
+    const LATE_REPLY = 'late reply that arrived after the stall';
+    sdk().bufferAnswer(LATE_REPLY);
+    await withTimeout(run, 'startSession after stall', 5_000);
+
+    expect(h.session.abortReason).toBe('transport:response_stall');
+    expect(h.session.conversationHistory.some(m => m.role === 'assistant' && m.content === LATE_REPLY)).toBe(false);
+    expect(h.session.claimedMessageIds).toEqual([]);
+    expect(h.pending()).toBe(2);
+  });
+
+  it('does not requeue a stored batch while claim acknowledgement is in flight', async () => {
+    const h = createHarness(2);
+    liveSessions.push(h.session);
+    (h.provider as any).responseStallMs = () => 40;
+    const run = h.provider.startSession(h.session);
+    await sdkStarted();
+    await sdk().until(() => sdk().prompts.length >= 1, 'init prompt');
+    sdk().answer(SKIP_REPLY);
+    await sdk().until(() => sdk().prompts.length >= 2, 'first observation');
+    h.session.memorySessionId = 'memory-4066';
+
+    const confirm = h.sessionManager.confirmClaimedMessages.bind(h.sessionManager);
+    let releaseAcknowledgement!: () => void;
+    const acknowledgementGate = new Promise<void>(resolve => { releaseAcknowledgement = resolve; });
+    h.sessionManager.confirmClaimedMessages = async sessionDbId => {
+      await acknowledgementGate;
+      return confirm(sessionDbId);
+    };
+
+    sdk().answer(`<observation>
+      <type>discovery</type><title>Stored once</title>
+      <narrative>The claimed batch produced an observation.</narrative>
+    </observation>`);
+    try {
+      await sdk().until(() => h.storedObservations.length === 1, 'durable store');
+      await settle(100); // Cross the 40 ms response-stall window before acknowledgement.
+      expect(h.session.abortReason).not.toBe('transport:response_stall');
+      expect(h.session.claimedMessageIds.length).toBe(1);
+      expect(h.pending()).toBe(2);
+    } finally {
+      releaseAcknowledgement();
+    }
+
+    await sdk().until(() => sdk().prompts.length >= 3, 'next observation');
+    expect(h.storedObservations.length).toBe(1);
+    expect(h.pending()).toBe(1);
+    h.session.abortController.abort();
+    await withTimeout(run, 'startSession after acknowledgement');
+  });
+});
+
+describe('ObserverResponsePacer', () => {
+  it('resolves for an answer that landed before the wait began', async () => {
+    const pacer = new ObserverResponsePacer();
+    const mark = pacer.mark();
+    pacer.answer();
+    expect(await pacer.waitForAnswer(mark, new AbortController().signal, 1_000)).toBe('answered');
+  });
+
+  it('reports a stall once the window passes without an answer', async () => {
+    const pacer = new ObserverResponsePacer();
+    expect(await pacer.waitForAnswer(pacer.mark(), new AbortController().signal, 10)).toBe('stalled');
+  });
+
+  it('restarts the silence window after response processing finishes', async () => {
+    const pacer = new ObserverResponsePacer();
+    const waiting = pacer.waitForAnswer(pacer.mark(), new AbortController().signal, 30);
+    pacer.processingStarted();
+    await settle(60);
+    expect(pacer.hasStalled).toBe(false);
+    pacer.processingFinished();
+    expect(await withTimeout(waiting, 'stall after processing')).toBe('stalled');
+  });
+
+  it('fences late frames only after a stall', async () => {
+    const answered = new ObserverResponsePacer();
+    const mark = answered.mark();
+    answered.answer();
+    await answered.waitForAnswer(mark, new AbortController().signal, 1_000);
+    expect(answered.hasStalled).toBe(false);
+
+    const stalling = new ObserverResponsePacer();
+    expect(await stalling.waitForAnswer(stalling.mark(), new AbortController().signal, 10)).toBe('stalled');
+    expect(stalling.hasStalled).toBe(true);
+  });
+
+  it('releases a waiter when the stream closes or the signal aborts', async () => {
+    const closing = new ObserverResponsePacer();
+    const closed = closing.waitForAnswer(closing.mark(), new AbortController().signal, 1_000);
+    closing.close();
+    expect(await closed).toBe('closed');
+
+    const aborting = new ObserverResponsePacer();
+    const controller = new AbortController();
+    const aborted = aborting.waitForAnswer(aborting.mark(), controller.signal, 1_000);
+    controller.abort();
+    expect(await aborted).toBe('aborted');
+  });
+
+  it('SDK activity restarts the stall window instead of counting from the prompt', async () => {
+    const pacer = new ObserverResponsePacer();
+    let outcome: string | null = null;
+    const waiting = pacer.waitForAnswer(pacer.mark(), new AbortController().signal, 60)
+      .then(result => { outcome = result; return result; });
+
+    // Keep streaming for well past the window.
+    for (let i = 0; i < 6; i++) {
+      await settle(30);
+      pacer.activity();
+    }
+    expect(outcome).toBeNull();
+
+    // Silence: now the window runs out.
+    expect(await withTimeout(waiting, 'stall after silence')).toBe('stalled');
+  });
+
+  it('an announced retry delay extends the stall window by that delay', async () => {
+    const pacer = new ObserverResponsePacer();
+    let outcome: string | null = null;
+    const waiting = pacer.waitForAnswer(pacer.mark(), new AbortController().signal, 20)
+      .then(result => { outcome = result; return result; });
+    pacer.activity(200);
+    await settle(80);
+    expect(outcome).toBeNull();
+    pacer.answer();
+    expect(await withTimeout(waiting, 'answer after retry')).toBe('answered');
+  });
+});
+
+// #3479: the Claude observer never resumes (a fresh, non-persisting SDK process
+// per start), yet each start used to push its init prompt onto the previous
+// generation's proxy history. A quota, auth or transport retry loop grew that
+// history by one init prompt per restart, without bound. The HTTP providers get
+// the same check in observer-generation-boundary.test.ts.
+describe('every Claude generator start opens a new generation (#3479)', () => {
+  const RESTARTS = 3;
+  const pauses: Array<[string, string]> = [
+    ['quota', "You've hit your session limit · resets 5:50pm (America/Los_Angeles)"],
+    ['auth', 'Not logged in · Please run /login'],
+    ['transport', 'fetch failed'],
+  ];
+
+  for (const [category, refusal] of pauses) {
+    it(`${RESTARTS} restarts after ${category} pauses leave exactly one generation`, async () => {
+      const h = createHarness(1);
+      liveSessions.push(h.session);
+
+      let previous: FakeSdk | null = null;
+      for (let attempt = 1; attempt <= RESTARTS; attempt++) {
+        h.session.abortController = new AbortController();
+        h.session.abortReason = null;
+        const run = h.provider.startSession(h.session);
+        previous = await sdkStarted(previous);
+        await sdk().until(() => sdk().prompts.length >= 1, `init prompt ${attempt}`);
+        sdk().answer(refusal);
+        await withTimeout(run, `attempt ${attempt}`);
+        expect(h.session.abortReason).toBe(`${category}:observer_text`);
+      }
+
+      // The last attempt's init prompt and nothing else: no stacked init
+      // prompts, and no refusal prose.
+      expect(h.session.conversationHistory).toHaveLength(1);
+      expect(h.session.conversationHistory[0].role).toBe('user');
+      expect(h.session.conversationHistory[0].content).toContain('<user_request>');
+      // The paused work is still queued for the next start.
+      expect(h.pending()).toBe(1);
+    }, 30_000);
+  }
+});
+
+// #2957: the SDK's result frame reports the context the model actually read
+// (fresh input + cache writes + cache reads), which the proxy history misses:
+// it never sees the SDK's system prompt or tool schemas. That reading feeds the
+// same generation budget. The HTTP providers get the same checks in
+// observer-measured-context.test.ts.
+describe('the measured Claude context feeds the generation budget (#2957)', () => {
+  // 150k tokens is 600k chars, far past the 100k-char default budget.
+  const OVER_BUDGET_USAGE = { usage: { input_tokens: 12, cache_read_input_tokens: 150_000, output_tokens: 2 } };
+
+  it('retires the generation before the next observation once a turn read past the budget', async () => {
+    const h = createHarness(3);
+    liveSessions.push(h.session);
+    const run = h.provider.startSession(h.session);
+    await sdkStarted();
+
+    await sdk().until(() => sdk().prompts.length >= 1, 'init prompt');
+    sdk().answer(SKIP_REPLY);
+    await sdk().until(() => sdk().prompts.length >= 2, 'first observation');
+    sdk().answer(SKIP_REPLY, OVER_BUDGET_USAGE);
+    await withTimeout(run, 'recycled generation');
+
+    // The proxy history is tiny, yet the second observation was never sent.
+    expect(sdk().prompts.length).toBe(2);
+    expect(h.session.abortReason).toBe('overflow:recycle');
+    expect(h.pending()).toBe(2);
+  });
+
+  it("does not keep an init turn's reading", async () => {
+    const h = createHarness(3);
+    liveSessions.push(h.session);
+    const run = h.provider.startSession(h.session);
+    await sdkStarted();
+
+    await sdk().until(() => sdk().prompts.length >= 1, 'init prompt');
+    sdk().answer(SKIP_REPLY, OVER_BUDGET_USAGE);
+    await sdk().until(() => sdk().prompts.length >= 2, 'first observation');
+
+    // The init reading was ignored, so the first observation still went out.
+    expect(h.session.lastContextTokens).toBeUndefined();
+    sdk().answer(SKIP_REPLY); // the fake SDK's default usage: 10 input tokens
+    await sdk().until(() => sdk().prompts.length >= 3, 'second observation');
+    expect(h.session.lastContextTokens).toBe(10);
+
+    h.session.abortController.abort();
+    await withTimeout(run, 'startSession after abort');
+  });
+});

@@ -7,7 +7,7 @@ export const windsurfAdapter: PlatformAdapter = {
     const toolInfo = r.tool_info ?? {};
     const actionName: string = r.agent_action_name ?? '';
 
-    const cwd = toolInfo.cwd ?? process.cwd();
+    const cwd = toolInfo.cwd || process.cwd();
     if (!isValidCwd(cwd)) {
       throw new AdapterRejectedInput('invalid_cwd');
     }
@@ -45,13 +45,21 @@ export const windsurfAdapter: PlatformAdapter = {
           toolInput: { command: toolInfo.command_line },
         };
 
-      case 'post_mcp_tool_use':
+      case 'post_mcp_tool_use': {
+        const name = toolInfo.mcp_tool_name ?? 'mcp_tool';
+        const server = toolInfo.mcp_server_name;
         return {
           ...base,
-          toolName: toolInfo.mcp_tool_name ?? 'mcp_tool',
+          // Windsurf sends the server and bare tool name separately. Retain
+          // both in the common MCP identity so our own search/timeline calls
+          // hit the recursion gate while external same-named tools still run.
+          toolName: typeof server === 'string' && server.length > 0 && typeof name === 'string' && name.length > 0
+            ? `mcp__${server}__${name}` : name,
+          nativeToolName: typeof toolInfo.mcp_tool_name === 'string' ? toolInfo.mcp_tool_name : undefined,
           toolInput: toolInfo.mcp_tool_arguments,
           toolResponse: toolInfo.mcp_result,
         };
+      }
 
       case 'post_cascade_response':
         return {

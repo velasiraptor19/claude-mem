@@ -4,6 +4,8 @@ import {
   redactHomeDir,
   redactAbsolutePaths,
   redactUrlQueryStrings,
+  redactResidualQueryStrings,
+  redactAssignmentSecrets,
   redactSecrets,
   collapseWhitespace,
   redactText,
@@ -71,82 +73,66 @@ describe('error-scrub: redactUrlQueryStrings', () => {
     expect(out).toContain('@10.0.0.5/path');
   });
 
-  it('redacts postgres connection-string credentials + query', () => {
-    const out = redactUrlQueryStrings('ECONNREFUSED postgres://u:p@host:5432/db?sslmode=require');
-    expect(out).not.toContain('u:p');
-    expect(out).not.toContain('sslmode=require');
-    expect(out).toContain('@host:5432/db');
+  it.each([
+    ['ECONNREFUSED postgres://u:p@host:5432/db?sslmode=require', ['u:p', 'sslmode=require'], '@host:5432/db'],
+    ['redis://admin:hunter2@cache:6379 down', ['admin', 'hunter2'], '@cache:6379'],
+    ['mongodb+srv://user:pass@cluster0.mongodb.net/db retrying', ['user:pass'], '@cluster0.mongodb.net/db'],
+    ['mysql://root:toor@db.internal:3306/app failed', ['root:toor'], '@db.internal:3306/app'],
+    ['amqp://guest:guest@broker:5672 unreachable', ['guest:guest'], '@broker:5672'],
+  ])('redacts connection-string secrets from %s', (input, secrets, kept) => {
+    const out = redactUrlQueryStrings(input);
+    for (const secret of secrets) expect(out).not.toContain(secret);
+    expect(out).toContain(kept);
   });
 
-  it('redacts redis:// credentials', () => {
-    const out = redactUrlQueryStrings('redis://admin:hunter2@cache:6379 down');
-    expect(out).not.toContain('admin');
-    expect(out).not.toContain('hunter2');
-    expect(out).toContain('@cache:6379');
+  it('redacts Slack webhook path secrets (secret is the path, not the query)', () => {
+    // Join at runtime so the file does not contain a contiguous webhook URL
+    // (GitHub push protection treats the Slack example host+path as a secret).
+    const webhook = ['https://hooks.slack.com', 'services', 'T00000000', 'B00000000', 'abcdefghijklmnopqrstuvwx'].join('/');
+    const out = redactUrlQueryStrings(`notify ${webhook} failed`);
+    expect(out).not.toContain('T00000000');
+    expect(out).not.toContain('abcdefghijklmnopqrstuvwx');
+    expect(out).toContain(`https://hooks.slack.com/services/${REDACTED}`);
+  });
+});
+
+describe('error-scrub: redactResidualQueryStrings', () => {
+  it('strips leftover query after path collapse destroyed scheme://', () => {
+    const out = redactResidualQueryStrings('GET https:/data?token=secret123&x=1 failed');
+    expect(out).not.toContain('token=secret123');
+    expect(out).toContain('https:/data');
+  });
+});
+
+describe('error-scrub: redactAssignmentSecrets', () => {
+  it('masks token= and api_key= assignments', () => {
+    const out = redactAssignmentSecrets('auth failed token=vendorkey_abc123 api_key=short');
+    expect(out).not.toContain('vendorkey_abc123');
+    expect(out).not.toContain('api_key=short');
+    expect(out).toContain(`token=${REDACTED}`);
+    expect(out).toContain(`api_key=${REDACTED}`);
   });
 
-  it('redacts mongodb+srv:// credentials', () => {
-    const out = redactUrlQueryStrings('mongodb+srv://user:pass@cluster0.mongodb.net/db retrying');
-    expect(out).not.toContain('user:pass');
-    expect(out).toContain('@cluster0.mongodb.net/db');
-  });
-
-  it('redacts mysql:// credentials', () => {
-    const out = redactUrlQueryStrings('mysql://root:toor@db.internal:3306/app failed');
-    expect(out).not.toContain('root:toor');
-    expect(out).toContain('@db.internal:3306/app');
-  });
-
-  it('redacts amqp:// credentials', () => {
-    const out = redactUrlQueryStrings('amqp://guest:guest@broker:5672 unreachable');
-    expect(out).not.toContain('guest:guest');
-    expect(out).toContain('@broker:5672');
+  it('does not treat error code= as a secret', () => {
+    expect(redactAssignmentSecrets('provider failed with code=12')).toContain('code=12');
   });
 });
 
 describe('error-scrub: redactSecrets', () => {
-  it('masks email addresses', () => {
-    const out = redactSecrets('contact alice@example.com about this');
-    expect(out).not.toContain('alice@example.com');
-    expect(out).toContain(REDACTED);
-  });
+  const jwt = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N';
+  const hex = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef';
 
-  it('masks sk- API keys', () => {
-    const out = redactSecrets('auth failed for sk-ABCdef1234567890ghij');
-    expect(out).not.toContain('sk-ABCdef1234567890ghij');
-    expect(out).toContain(REDACTED);
-  });
-
-  it('masks phc_ PostHog keys', () => {
-    const out = redactSecrets('key phc_ABCdef1234567890ghijKLMNOP invalid');
-    expect(out).not.toContain('phc_ABCdef1234567890ghijKLMNOP');
-    expect(out).toContain(REDACTED);
-  });
-
-  it('masks generic long tokens, hex blobs and JWTs', () => {
-    const jwt = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N';
-    const hex = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef';
-    const out = redactSecrets(`jwt=${jwt} hash=${hex}`);
-    expect(out).not.toContain(jwt);
-    expect(out).not.toContain(hex);
-    expect(out).toContain(REDACTED);
-  });
-
-  it('masks AWS access key IDs', () => {
-    const out = redactSecrets('creds AKIAIOSFODNN7EXAMPLE rejected');
-    expect(out).not.toContain('AKIAIOSFODNN7EXAMPLE');
-    expect(out).toContain(REDACTED);
-  });
-
-  it('masks ASIA/AROA-prefixed AWS key IDs too', () => {
-    const out = redactSecrets('temp key ASIAY34FZKBOKMUTVV7A here');
-    expect(out).not.toContain('ASIAY34FZKBOKMUTVV7A');
-    expect(out).toContain(REDACTED);
-  });
-
-  it('masks IPv4 addresses', () => {
-    const out = redactSecrets('connect failed to 10.0.0.5:5432');
-    expect(out).not.toContain('10.0.0.5');
+  it.each([
+    ['contact alice@example.com about this', ['alice@example.com']],
+    ['auth failed for sk-ABCdef1234567890ghij', ['sk-ABCdef1234567890ghij']],
+    ['key phc_ABCdef1234567890ghijKLMNOP invalid', ['phc_ABCdef1234567890ghijKLMNOP']],
+    [`jwt=${jwt} hash=${hex}`, [jwt, hex]],
+    ['creds AKIAIOSFODNN7EXAMPLE rejected', ['AKIAIOSFODNN7EXAMPLE']],
+    ['temp key ASIAY34FZKBOKMUTVV7A here', ['ASIAY34FZKBOKMUTVV7A']],
+    ['connect failed to 10.0.0.5:5432', ['10.0.0.5']],
+  ])('masks secrets in %s', (input, secrets) => {
+    const out = redactSecrets(input);
+    for (const secret of secrets) expect(out).not.toContain(secret);
     expect(out).toContain(REDACTED);
   });
 
@@ -174,14 +160,26 @@ describe('error-scrub: scrubMessage caps length', () => {
     expect(out.length).toBe(MESSAGE_MAX_CHARS);
   });
 
-  it('applies the full pipeline in order', () => {
-    const home = os.homedir();
-    const out = scrubMessage(
-      `boom at ${home}/p/file.ts calling https://h/x?k=sk-ABCdef1234567890ghij mail bob@h.com`
-    );
-    expect(out).not.toContain(home);
-    expect(out).not.toContain('k=sk-');
-    expect(out).not.toContain('bob@h.com');
+  it('redacts query tokens on multi-segment URLs (path heuristics must not run first)', () => {
+    // Reproducer: collapsing /v1/data?token=… to a basename used to destroy
+    // `://`, so URL query redaction never fired and short tokens leaked.
+    const out = scrubMessage('GET https://api.example.com/v1/data?token=secret123&x=1 failed');
+    expect(out).not.toContain('secret123');
+    expect(out).not.toContain('token=');
+    expect(out).not.toContain('x=1');
+  });
+
+  it('redacts path-like query strings that have no scheme:// prefix', () => {
+    const out = scrubMessage('redirect /oauth/callback?access_token=vendorkey_abc123 done');
+    expect(out).not.toContain('vendorkey_abc123');
+    expect(out).not.toContain('access_token=');
+  });
+
+  it('redacts Slack webhook URLs end-to-end', () => {
+    const webhook = ['https://hooks.slack.com', 'services', 'T00000000', 'B00000000', 'abcdefghijklmnopqrstuvwx'].join('/');
+    const out = scrubMessage(`notify ${webhook} failed`);
+    expect(out).not.toContain('T00000000');
+    expect(out).not.toContain('abcdefghijklmnopqrstuvwx');
   });
 });
 
