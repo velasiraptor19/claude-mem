@@ -26,7 +26,15 @@ geri tak” talimatı terfi yetkisidir. Uygulanan sıra:
    kaldırılmadı veya terminalmiş gibi değiştirilmedi.
 7. Yeni hook dosyalarını geri koy; installed_plugins ve Codex plugin ayarlarını
    güncelle, önceki kapalı skill seçimlerini yeni sürüm yolunda koru. Launcher
-   self-heal'i açık `CLAUDE_PLUGIN_ROOT` ile çalıştır.
+   self-heal'i açık `CLAUDE_PLUGIN_ROOT` ile çalıştır. **Codex plugin manifest'i
+   `codex-no-bundled-hooks.json` kullanır: plugin'i açmak hook kurmak değildir.**
+   Native `registerCodexUserHooks` ile aktif `/root/.codex/hooks.json` dosyasına
+   7 olayı kaydet; ikinci çağrının changed=false olduğunu doğrula. Native
+   `codexHooksCheck` OK ve gerçek launcher üzerinden context/session-init/
+   observation/summarize kabul testi geçmeden “Codex hook'ları kuruldu” deme.
+   tree-sitter paketinin bulunması da binary'nin kurulu olduğu anlamına gelmez;
+   ilgili plugin köklerinde native verified provisioner ile CLI kullanılabilirliğini
+   ve MCP smart_outline'ın sembol döndürdüğünü doğrula.
 8. Claude/Codex oturumlarını yeniden aç. Codex yeni matcher için isterse
    `/hooks` üzerinden kullanıcı onayını al; eski trusted_hash'leri yeni kod
    adına yeniden üretip onay verilmiş gibi yapma.

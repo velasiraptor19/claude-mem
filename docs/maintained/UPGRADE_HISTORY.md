@@ -266,3 +266,33 @@ kayıt okundu; `work_state_write` ile çalışma durumu güncellendi. Geniş fas
 lane üç test sürecini tamamladı ve nonzero döndü; tam regresyon geçmedi.
 Fork dalı GitHub'a gönderildi: commit `572186b60`, PR #1
 (https://github.com/velasiraptor19/claude-mem/pull/1). `main` birleştirilmedi.
+
+
+### Aynı gün: boş Codex /hooks ekranı düzeltmesi
+
+Kullanıcı exit/restart sonrasında /hooks ekranında claude-mem göremedi.
+Doğrudan kanıt: native plugin manifest'i hooks/codex-no-bundled-hooks.json
+kullanıyordu ve /root/.codex/hooks.json yoktu. Önceki “hook'lar geri takıldı”
+ifadesi Codex otomatik capture için eksikti: plugin payload'ını geri koymak
+native user-hook kaydını oluşturmuyordu. Mevcut 19 ilgili testin geçmesi,
+canlı home'un kurulmuş olduğunu kanıtlamıyordu.
+
+Yeni kaynak yaması eklenmeden native registerCodexUserHooks ile root home'a
+7 olay kaydedildi. İkinci çağrı changed=false; native codexHooksCheck OK.
+Codex'in kullanıcı güven onayı otomatik yazılmadı; /hooks ekranında onay
+istenirse kullanıcı verir. Diğer home ve araçların hook kayıtları değiştirilmedi.
+
+smart_search ayrıca Codex cache'inde tree-sitter CLI eksikliği bildirdi.
+Native checksum kontrollü provisioner ile 0.26.9 kuruldu, aktif plugin
+kopyalarına eşlendi; MCP smart_outline TypeScript sembollerini döndürdü.
+Worker'ın kendi Claude cache'inde CLI'yi daha önce provision etmesi Codex
+MCP cache'ini düzeltmiyordu; her etkin plugin kökü ayrı kontrol edilmeli.
+
+Sınırlı launcher kabul testi canonical claude-mem projesinde çalıştırıldı;
+yalnız açıkça test olarak işaretli teknik kurulum sonuçları gönderildi.
+SessionStart bağlam çıktısı 3.881 bayt; session-init ve observation exit=0;
+NVIDIA başarılı yanıt verdi, observation #24583 kaydoldu. Stop/summarize
+exit=0; summary #3951 oluşturuldu. Yeni gözlem native MCP search ve timeline
+ile bulundu. Bu, launcher→worker→NVIDIA→SQLite→recall zincirini kanıtlar;
+Codex UI güven onayı ve doğal kullanıcı olayının otomatik tetiklenmesi ayrıca
+kullanıcı oturumunda doğrulanır. NVIDIA'nın uzun sohbet kalitesi değerlendirmesi değildir.
