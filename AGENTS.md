@@ -1,37 +1,35 @@
-# Claude-Mem architecture rules
+# claude-mem Bakımı Yapılan Depo Kuralları
 
-Read [the observer lifecycle contract](docs/architecture/observer-lifecycle.md)
-before changing capture, queueing, retries, provider dispatch, or recovery.
+Şu belgeleri okuyup uygula:
 
-- The local observer is a stateful reducer, not a durable job consumer.
-- Live observation, file-edit, and summary inputs must not be persisted for
-  automatic replay. Use the common live handoff and `SessionMessageBuffer`.
-- Quota exhaustion and authentication failures discard pending inference
-  inputs. A quota reset, login, restart, timer, or a later successful store
-  never authorizes backfill, and paused work is never resumed on such proof.
-- Keep active buffering bounded. Do not add another batching queue, retry
-  store, startup sweep, or platform-specific recovery loop.
-- Preserve the paid-send budget and completed-observation deduplication.
-  An ambiguous request must not acquire a fresh budget by changing its path.
-- Original transcripts, raw source evidence, saved memories, receipt IDs,
-  and synchronization of already-saved records are distinct from inference
-  work. Do not delete them to clear a queue or make them trigger paid replay.
-- Recovery must be a separately specified, explicit workflow with a matching
-  source position and observer state. A last observation ID, delivery receipt,
-  byte offset, or collection of pending fragments alone is not a checkpoint.
-- Integration and community fixes must obey the same rules. Tests proving
-  that a queue drains are insufficient; test that an outage cannot create
-  later, unrequested inference spend.
+- `docs/maintained/UPGRADE_RUNBOOK.md`
+- `docs/maintained/UPGRADE_HISTORY.md`
+- `docs/maintained/CUSTOMIZATIONS.md`
+- `docs/maintained/UPSTREAM_13.14_TO_13.24.md`
+- `docs/maintained/RETRIEVAL_BASELINE.md`
+- `docs/maintained/GLOBAL_CODEX_AGENTS.md`
 
-Read [the state rules](docs/architecture/state-machines.md) before adding or
-changing a status, phase, stage or mode that a person or an agent can see.
+Mantıksal hafıza projesi `claude-mem`dir; sürüm worktree'leri ayrı hafıza
+projeleri değil, tarihsel kaynak varyantlarıdır. Hafıza araması bir indekstir,
+yayın otoritesi değildir: güncel dosyalar, Git diff'leri, resmî etiketler,
+manifestler, attestation kayıtları ve kalıcı makbuzlar önceliklidir.
 
-- Such a state has one definition. Types, request checks, label tables and
-  tests import it; none of them types the values again.
-- Word each state for people in a `Record<State, …>`, so a new state fails the
-  typecheck until every screen has words for it.
-- Delete a state that is written and never read. Do not add a state-machine
-  library or a transition framework.
+Güncellemede resmî etiketten birebir aday oluştur; aynı paket sürümündeki
+upstream ve bakımı yapılan ağacı `scripts/maintained-diff-report.cjs` ile
+karşılaştır; bu diff'i ve upstream sürümler arası diff ile kesişimini incele;
+tam manifesti derleyip doğrula ve yalnız `maintained-upgrade.sh` üzerinden
+terfi ettir. Tek root worker durdurulmadan önce hook'lar kalıcı biçimde
+ayrılmış ve drain edilmiş olmalıdır. Yayın fence'ini asla atlama; kanıtlanmamış
+lease'i silme; SQLite/Chroma'yı doğrudan değiştirme; ilgisiz legacy MCP
+sürecini öldürme; güncelleme sırasında isteğe bağlı istemci/sağlayıcı açma.
 
-Run relevant behavioral tests, the root TypeScript check, and the bundle build.
-Never call a source-only change shipped: installed clients execute the bundles.
+Etkin istemciler Claude ve Codex'tir. Cursor, Grok Bot, Cowork, bulut eşitleme,
+gateway ve pilotlar açık kullanıcı onayı gerektirir. NVIDIA girdileri sınırlı
+olmalı; sır, kimlik bilgisi, PHI, ödeme verisi veya gereksiz ham transcript
+içermemelidir.
+
+Bakımı yapılan her değişiklikten sonra regresyon testi ekle, üretilen
+artifact'leri yeniden derle, manifesti yenileyip doğrula, ilgili
+sağlık/kimlik/veri kontrollerini çalıştır ve yeni olay ya da invariant'ı bakım
+belgelerine ekle. Değişken PID, hash, sürüm veya canlı durum değerlerini bu
+dosyaya yazma.
