@@ -259,3 +259,10 @@ uydurulmadı. Bu kayıt açık eski giriş noktalarının yeniden 13.x başlatma
 engeller. Geçiş receipt/manifest/snapshot dizini:
 `/root/.claude-mem/upgrades/15.21.0-20261118T001543Z`.
 DB şeması yükseldiği için rollback eski DB snapshot'ından yapılmalıdır.
+
+Terfi sonrasında Codex MCP kataloğu canlı olarak 15.x araçlarına yenilendi.
+`search → timeline → get_observations` ile canonical projeden seçili eski
+kayıt okundu; `work_state_write` ile çalışma durumu güncellendi. Geniş fast
+lane üç test sürecini tamamladı ve nonzero döndü; tam regresyon geçmedi.
+Fork dalı GitHub'a gönderildi: commit `572186b60`, PR #1
+(https://github.com/velasiraptor19/claude-mem/pull/1). `main` birleştirilmedi.
