@@ -296,3 +296,16 @@ exit=0; summary #3951 oluşturuldu. Yeni gözlem native MCP search ve timeline
 ile bulundu. Bu, launcher→worker→NVIDIA→SQLite→recall zincirini kanıtlar;
 Codex UI güven onayı ve doğal kullanıcı olayının otomatik tetiklenmesi ayrıca
 kullanıcı oturumunda doğrulanır. NVIDIA'nın uzun sohbet kalitesi değerlendirmesi değildir.
+
+
+### Kullanıcı güven onayından sonra doğal otomatik capture doğrulaması
+
+Kullanıcı Codex /hooks üzerinden güven verdi. Yedi native user-hook'un enabled
+ve trusted_hash değerleri mevcut komutlarla bire bir eşleşti. Kullanıcının
+son mesajı UserPromptSubmit üzerinden canonical claude-mem oturumunu (3630)
+açtı; bu denetimin gerçek PostToolUse olayı otomatik kuyruğa alındı. NVIDIA
+başarılı üretim yaptı ve observation #24584 kaydedildi, Chroma sync tetiklendi.
+Bu kanıt önceki elle çağrılan kabul testinden ayrıdır: doğal Codex olayının
+otomatik işlendiği doğrulandı. Worker 15.21.0 health OK/readiness ready;
+inceleme anında pending queue sıfırdı. Bu turun Stop özetinin oluşması yanıt
+sonrasındadır; o özet henüz ayrıca doğrulanmadı.
